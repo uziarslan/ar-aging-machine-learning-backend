@@ -194,7 +194,7 @@ def _clean_and_standardize(df: pd.DataFrame) -> pd.DataFrame:
     def to_numeric_series(series_like) -> pd.Series:
         if series_like is None or series_like not in df.columns:
             return pd.Series([0.0] * len(df))
-        return df[series_like].apply(_to_number).fillna(0.0).astype(float)
+        return df[series_like].apply(_to_number).fillna(0.0).astype(float).round().astype(int)
 
     standardized["bucket_current"] = to_numeric_series(c_current)
     standardized["bucket_0_30"] = to_numeric_series(c_0_30)
@@ -203,7 +203,7 @@ def _clean_and_standardize(df: pd.DataFrame) -> pd.DataFrame:
     standardized["bucket_90_plus"] = to_numeric_series(c_90_plus)
 
     if c_total is not None and c_total in df.columns:
-        total_series = df[c_total].apply(_to_number).fillna(0.0).astype(float)
+        total_series = df[c_total].apply(_to_number).fillna(0.0).astype(float).round().astype(int)
     else:
         total_series = (
             standardized["bucket_current"]
@@ -211,7 +211,7 @@ def _clean_and_standardize(df: pd.DataFrame) -> pd.DataFrame:
             + standardized["bucket_31_60"]
             + standardized["bucket_61_90"]
             + standardized["bucket_90_plus"]
-        )
+        ).round().astype(int)
     standardized["total"] = total_series
 
     # Clean description, remove rows where description is missing/blank
@@ -460,7 +460,7 @@ class PredictionRequest(BaseModel):
     client_id: str = Field(..., description="Client ID to predict for")
     target_month: str = Field(..., description="Target month in YYYY-MM format")
     target_total: float = Field(..., gt=0, description="Target total amount")
-    carry_threshold: float = Field(0.5, ge=0, le=1, description="Carry-forward threshold")
+    carry_threshold: float = Field(0.2, ge=0, le=1, description="Carry-forward threshold")
     # New: optional additional entries that should be deducted from target_total
     additional_entries: Optional[List[Dict[str, Any]]] = Field(None, description="List of additional entries: {description, amount}")
 
@@ -896,17 +896,38 @@ async def predict_aging(request: PredictionRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load models from database: {e}")
 
-        # Deduct additional entries from target total for the ML allocation
-        additional_total = float(sum(e["amount"] for e in request.additional_entries or []))
+        # Partition additional entries into those matching last month's clients vs new clients
+        def _norm_desc(s: str) -> str:
+            return (s or "").strip().lower()
+
+        # Use the same cleaning function as the generator for consistent matching
+        from train_generate_ar import _clean_description
+        # Normalize case for matching by converting to lowercase after cleaning
+        prev_desc_set = {_clean_description(d.get("description", "")).lower() for d in prev_docs}
+        
+        add_entries_all = request.additional_entries or []
+        matched_add_entries: List[Dict[str, Any]] = []
+        new_add_entries: List[Dict[str, Any]] = []
+        for e in add_entries_all:
+            try:
+                amt = float(e.get("amount", 0) or 0)
+            except Exception:
+                amt = 0.0
+            if amt <= 0:
+                continue
+            desc_clean = _clean_description(str(e.get("description", ""))).lower()
+            if desc_clean in prev_desc_set:
+                matched_add_entries.append({"description": e.get("description", ""), "amount": amt})
+            else:
+                new_add_entries.append({"description": e.get("description", ""), "amount": amt})
+
+
+        # Don't deduct user overrides from target - let generator produce full target
+        # We'll override specific rows after generation
         effective_target_total = float(request.target_total)
         warnings: List[str] = []
-        if additional_total > 0:
-            if additional_total >= effective_target_total:
-                warnings.append("Additional entries meet or exceed target; model allocation set to 0.")
-                effective_target_total = 0.0
-            else:
-                effective_target_total = max(0.0, effective_target_total - additional_total)
 
+        # Generate predictions without overrides - we'll apply them manually after
         predictions_list = generate_next_month_with_models(
             clf=clf,
             regr=regr,
@@ -914,7 +935,9 @@ async def predict_aging(request: PredictionRequest):
             last_month_str=prev_month_str,
             next_month_str=request.target_month,
             target_total=effective_target_total,
-            history_df=df_hist
+            history_df=df_hist,
+            overrides=None,  # No overrides to generator
+            carry_threshold=float(request.carry_threshold or 0.2),
         )
 
         # Flatten to legacy schema expected by frontend: top-level bucket keys
@@ -929,6 +952,8 @@ async def predict_aging(request: PredictionRequest):
                 "61_90": float(aging.get("61_90", 0.0)),
                 "90_plus": float(aging.get("90_plus", 0.0)),
                 "total": float(p.get("total", 0.0)),
+                # Expose override flag for frontend logic
+                "is_override": bool(p.get("is_override", False)),
             })
 
         # Fallback: if predictions are empty or all-zero buckets, build a DB-only roll-forward
@@ -974,27 +999,128 @@ async def predict_aging(request: PredictionRequest):
         for p in flat_predictions:
             if p.get("total", 0) > 0 and (p.get("0_30", 0) + p.get("31_60", 0) + p.get("61_90", 0) + p.get("90_plus", 0) == 0):
                 p["0_30"] = float(p["total"]) 
-                p["current"] = float(p["total"]) 
+                p["current"] = float(p["total"])
 
-        # Prepend additional entries as separate rows (remain fixed as entered)
-        additional_rows: List[Dict[str, Any]] = []
-        if request.additional_entries:
-            for entry in request.additional_entries:
-                amt = float(entry["amount"]) if entry.get("amount") is not None else 0.0
-                if amt <= 0:
-                    continue
-                additional_rows.append({
-                    "description": str(entry.get("description", "")).strip() or "New Entry",
-                    "current": amt,
-                    "0_30": amt,
+        # Build previous month map for override calculations
+        prev_map: Dict[str, Dict[str, float]] = {}
+        for d in prev_docs:
+            prev_map[_norm_desc(d.get("description", ""))] = {
+                "0_30": float(d["aging"].get("0_30", 0.0)),
+                "31_60": float(d["aging"].get("31_60", 0.0)),
+                "61_90": float(d["aging"].get("61_90", 0.0)),
+                "90_plus": float(d["aging"].get("90_plus", 0.0)),
+            }
+
+        # Apply manual overrides for matched entries
+        for e in matched_add_entries:
+            amt = float(e["amount"]) if e.get("amount") is not None else 0.0
+            if amt <= 0:
+                continue
+            desc_raw = str(e.get("description", "")).strip()
+            desc_clean = _clean_description(desc_raw).lower()
+            
+            # Find matching row in predictions
+            found = False
+            for p in flat_predictions:
+                pred_desc_clean = _clean_description(p["description"]).lower()
+                if pred_desc_clean == desc_clean:
+                    # Apply override: set 0-30 to exact amount (no capping for user overrides)
+                    prev_buckets = prev_map.get(_norm_desc(desc_raw), {})
+                    override_0_30 = amt  # Use exact user amount, no capping
+                    
+                    # Apply aging trend to other buckets (decreasing)
+                    prev_0_30 = prev_buckets.get("0_30", 0)
+                    prev_31_60 = prev_buckets.get("31_60", 0)
+                    prev_61_90 = prev_buckets.get("61_90", 0)
+                    prev_90_plus = prev_buckets.get("90_plus", 0)
+                    
+                    p["0_30"] = float(override_0_30)
+                    p["31_60"] = float(min(p.get("31_60", 0), prev_0_30 * 0.9))
+                    p["61_90"] = float(min(p.get("61_90", 0), prev_31_60 * 0.9))
+                    p["90_plus"] = float(min(p.get("90_plus", 0), (prev_61_90 + prev_90_plus) * 0.9))
+                    
+                    # Recalculate total and current
+                    p["total"] = p["0_30"] + p["31_60"] + p["61_90"] + p["90_plus"]
+                    p["current"] = p["total"]
+                    p["is_override"] = True
+                    found = True
+                    break 
+
+        # Merge additional entries into predictions
+        # Build lookup maps
+        pred_map: Dict[str, Dict[str, Any]] = { _norm_desc(p["description"]): p for p in flat_predictions }
+        # Secondary map using stricter cleaning to align with generator cleaning
+        def _clean_key(s: str) -> str:
+            s = (s or "").lower().strip()
+            # normalize whitespace and strip punctuation-like chars
+            import re
+            s = re.sub(r"[\-_,.;:/\\]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+        pred_map_clean: Dict[str, Dict[str, Any]] = {}
+        for p in flat_predictions:
+            pred_map_clean[_clean_key(p["description"])] = p
+
+        # 1) Matched entries already handled via overrides in the generator
+        # 2) Append brand-new entries (not in last month) as standalone rows with only 0-30
+        # NOTE: Matched entries are processed by generator as overrides, so we only add truly new entries here
+        for e in new_add_entries:
+            amt = float(e["amount"]) if e.get("amount") is not None else 0.0
+            if amt <= 0:
+                continue
+            desc_raw = str(e.get("description", "")).strip() or "New Entry"
+            desc_key = _norm_desc(desc_raw)
+            desc_clean_key = _clean_key(desc_raw)
+            # Avoid duplicate if somehow predicted created same desc
+            if desc_key in pred_map or desc_clean_key in pred_map_clean:
+                # If generator already created this description, OVERRIDE it to EXACT user 0-30 (others 0)
+                pred_row = pred_map.get(desc_key) or pred_map_clean.get(desc_clean_key)
+                amt_int = int(round(amt))
+                pred_row["0_30"] = float(amt_int)
+                pred_row["31_60"] = 0.0
+                pred_row["61_90"] = 0.0
+                pred_row["90_plus"] = 0.0
+                pred_row["total"] = float(amt_int)
+                pred_row["current"] = float(amt_int)
+                pred_row["is_override"] = True
+            else:
+                amt_int = int(round(amt))
+                row = {
+                    "description": desc_raw,
+                    "current": float(amt_int),
+                    "0_30": float(amt_int),
                     "31_60": 0.0,
                     "61_90": 0.0,
                     "90_plus": 0.0,
-                    "total": amt,
-                })
+                    "total": float(amt_int),
+                    "is_override": True,
+                }
+                flat_predictions.append(row)
+                pred_map[desc_key] = row
+                pred_map_clean[desc_clean_key] = row
 
-        combined_predictions = additional_rows + flat_predictions
+        combined_predictions = flat_predictions
         final_total = float(sum(p["total"] for p in combined_predictions))
+        
+        # Final adjustment to hit exact target
+        target_diff = float(request.target_total) - final_total
+        if abs(target_diff) > 1.0:  # Only adjust if difference is more than $1
+            # Adjust generator rows (non-override) proportionally
+            generator_rows = [p for p in combined_predictions if not p.get("is_override", False)]
+            if generator_rows and target_diff != 0:
+                total_generator = sum(p["total"] for p in generator_rows)
+                if total_generator > 0:
+                    adjustment_factor = 1.0 + (target_diff / total_generator)
+                    for p in generator_rows:
+                        p["total"] = float(p["total"] * adjustment_factor)
+                        p["current"] = p["total"]
+                        # Adjust 0_30 proportionally to maintain bucket ratios
+                        if p["total"] > 0:
+                            old_0_30 = p.get("0_30", 0)
+                            if old_0_30 > 0:
+                                p["0_30"] = float(p["0_30"] * adjustment_factor)
+                    final_total = float(sum(p["total"] for p in combined_predictions))
+        
         audit_snapshot_id = str(uuid4())
         
         return PredictionResponse(

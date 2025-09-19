@@ -782,6 +782,10 @@ def _consolidate_small_rows(rows: List[Dict[str, Any]], max_small: int = 25) -> 
     
     # Separate large and small rows
     for row in rows:
+        # Never consolidate override rows or the Adjustment row
+        if row.get("is_override") or row.get("description") == "Adjustment":
+            large_rows.append(row)
+            continue
         if row["total"] >= 1000:
             large_rows.append(row)
         else:
@@ -991,75 +995,73 @@ def _scale_to_exact_target(rows: List[Dict[str, Any]], target_total: float, max_
     additional_needed = target_total - current_total
     
     if additional_needed > 0 and rows:
-        # Distribute additional business as NEW amounts (preserves aging ratios)
-        # Focus on larger customers to minimize ratio distortion
-        
-        # Sort by total descending - add more to larger customers
-        rows.sort(key=lambda x: x["total"], reverse=True)
-        
-        # Distribute more aggressively to hit exact target
-        remaining = additional_needed
-        
-        # PROTECTIVE SCALING: Completely protect very small customers from scaling
-        # Identify customer tiers: tiny (<25k), small (25k-50k), large (>50k)
-        tiny_customers = [r for r in rows if r["total"] < 25000]
-        small_customers = [r for r in rows if 25000 <= r["total"] < 50000]
-        large_customers = [r for r in rows if r["total"] >= 50000]
-        
-        print(f"Scaling distribution: {len(tiny_customers)} tiny, {len(small_customers)} small, {len(large_customers)} large customers")
-        
-        # First: Add 95% to large customers only (they can handle scaling)
-        if large_customers and remaining > 0:
-            large_total = sum(r["total"] for r in large_customers)
-            first_pass_amount = remaining * 0.95  # Use 95% for large customers
-            
-            for row in large_customers:
-                if large_total > 0 and first_pass_amount > 0:
-                    row_proportion = row["total"] / large_total
-                    additional_for_row = first_pass_amount * row_proportion
-                    
-                    addition = int(round(additional_for_row))
-                    row["aging"]["0_30"] += addition
-                    remaining -= addition
-                    first_pass_amount -= addition
-        
-        # Second: Add small amount to medium customers only (skip tiny)
-        if small_customers and remaining > 0:
-            small_total = sum(r["total"] for r in small_customers)
-            second_pass_amount = remaining * 0.8  # Use 80% of remaining
-            
-            for row in small_customers:
-                if small_total > 0 and second_pass_amount > 0:
-                    row_proportion = row["total"] / small_total
-                    additional_for_row = second_pass_amount * row_proportion * 0.5  # Reduced factor
-                    
-                    addition = int(round(additional_for_row))
-                    row["aging"]["0_30"] += addition
-                    remaining -= addition
-                    second_pass_amount -= addition
-        
-        # Third: SKIP tiny customers entirely to preserve their ratios
-        # Any remaining amount goes to the largest customer
-        if remaining > 0 and large_customers:
-            largest_customer = max(large_customers, key=lambda x: x["total"])
-            largest_customer["aging"]["0_30"] += remaining
-            remaining = 0
+        # New strategy: add to 31-60 bucket of NON-override rows first
+        remaining = int(round(additional_needed))
+        non_override_rows = [r for r in rows if not r.get("is_override")]
+        # Prefer larger rows to absorb more
+        non_override_rows.sort(key=lambda r: r["total"], reverse=True)
+
+        for row in non_override_rows:
+            if remaining <= 0:
+                break
+            # Add as much as possible to 31-60
+            addition = min(remaining, max(1, remaining // max(1, len(non_override_rows))))
+            row["aging"]["31_60"] = int(row["aging"].get("31_60", 0)) + int(addition)
+            remaining -= addition
+
+        # If still remaining, add a dedicated Adjustment row (31-60 only)
+        if remaining > 0:
+            rows.append({
+                "description": "Adjustment",
+                "month": "",
+                "aging": {
+                    "current": 0.0,
+                    "0_30": 0.0,
+                    "31_60": float(remaining),
+                    "61_90": 0.0,
+                    "90_plus": 0.0,
+                },
+                "predicted": True,
+                "total": float(remaining),
+                "protected_0_30": False,
+                "is_override": False,
+            })
     
     elif additional_needed < 0 and rows:
-        # Need to reduce - remove from 0-30 buckets (least disruptive to aging)
-        reduction_needed = abs(additional_needed)
-        
-        # Remove proportionally from 0-30 buckets
-        total_0_30 = sum(r["aging"]["0_30"] for r in rows)
-        
-        for row in rows:
-            if total_0_30 > 0 and reduction_needed > 0:
-                row_proportion = row["aging"]["0_30"] / total_0_30
-                reduction_for_row = min(reduction_needed, reduction_needed * row_proportion)
-                reduction_for_row = min(reduction_for_row, row["aging"]["0_30"])  # Don't go negative
-                
-                row["aging"]["0_30"] -= int(round(reduction_for_row))
-                reduction_needed -= int(round(reduction_for_row))
+        # Need to reduce - remove from 31-60 buckets of NON-override rows first
+        reduction_needed = int(abs(round(additional_needed)))
+        non_override_rows = [r for r in rows if not r.get("is_override")]
+        # Sort by largest 31-60 first
+        non_override_rows.sort(key=lambda r: r["aging"].get("31_60", 0), reverse=True)
+
+        # Reduce from 31-60
+        for row in non_override_rows:
+            if reduction_needed <= 0:
+                break
+            avail = int(row["aging"].get("31_60", 0))
+            if avail <= 0:
+                continue
+            take = min(reduction_needed, avail)
+            row["aging"]["31_60"] = avail - take
+            reduction_needed -= take
+
+        # If still need reductions, reduce from 61-90, then 90+, then 0-30 (non-override rows)
+        if reduction_needed > 0:
+            for bucket in ["61_90", "90_plus", "0_30"]:
+                if reduction_needed <= 0:
+                    break
+                for row in non_override_rows:
+                    if reduction_needed <= 0:
+                        break
+                    # Skip 0-30 if row has protected override
+                    if bucket == "0_30" and row.get("protected_0_30"):
+                        continue
+                    avail = int(row["aging"].get(bucket, 0))
+                    if avail <= 0:
+                        continue
+                    take = min(reduction_needed, avail)
+                    row["aging"][bucket] = avail - take
+                    reduction_needed -= take
     
     # CRITICAL: Final enforcement of exact row totals
     rows = _force_exact_row_totals(rows)
@@ -1105,23 +1107,41 @@ def _scale_to_exact_target(rows: List[Dict[str, Any]], target_total: float, max_
                         addition = min(diff, max(1, abs(diff) // (len(rows) // 2)))
                     else:  # Bottom half gets less
                         addition = min(diff, 1)
-                    row["aging"]["0_30"] += addition
+                    if not row.get("protected_0_30"):
+                        row["aging"]["0_30"] += addition
                     diff -= addition
                 elif diff < 0 and row["aging"]["0_30"] > 0:
                     # Remove from 0-30 bucket
-                    reduction = min(abs(diff), row["aging"]["0_30"], 1)
-                    row["aging"]["0_30"] -= reduction
+                    if not row.get("protected_0_30"):
+                        reduction = min(abs(diff), row["aging"]["0_30"], 1)
+                        row["aging"]["0_30"] -= reduction
+                        diff += reduction
+                        attempts += 1
+                        continue
                     diff += reduction
                 
                 attempts += 1
                 
-        # FINAL VERIFICATION: If still off, force exact match
-        if diff != 0 and rows:
-            largest_row = max(rows, key=lambda x: x["total"])
-            if diff > 0:
-                largest_row["aging"]["0_30"] += diff
-            elif diff < 0 and largest_row["aging"]["0_30"] >= abs(diff):
-                largest_row["aging"]["0_30"] -= abs(diff)
+        # FINAL VERIFICATION: If still off, use/create Adjustment row on 31-60
+        if diff != 0:
+            # Try to find an existing Adjustment row
+            adj = next((r for r in rows if r.get("description") == "Adjustment"), None)
+            if adj is None:
+                adj = {
+                    "description": "Adjustment",
+                    "month": "",
+                    "aging": {"current": 0.0, "0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "90_plus": 0.0},
+                    "predicted": True,
+                    "total": 0.0,
+                    "protected_0_30": False,
+                    "is_override": False,
+                }
+                rows.append(adj)
+            # Apply diff to 31-60 (positive adds, negative subtracts but not below zero)
+            new_31_60 = int(max(0, adj["aging"]["31_60"] + diff))
+            adj["aging"]["31_60"] = new_31_60
+            # Recompute totals after adjustment
+            rows = _force_exact_row_totals(rows)
     
     # CRITICAL: Final enforcement of exact row totals
     rows = _force_exact_row_totals(rows)
@@ -1209,19 +1229,44 @@ def _generate_next_month_core(
     next_month_str: str,
     target_total: float,
     history_df: Optional[pd.DataFrame] = None,
+    overrides: Optional[Dict[str, float]] = None,
+    carry_threshold: float = 0.2,
 ) -> List[Dict[str, Any]]:
     """Generate next month's AR aging rows using realistic aging simulation."""
     
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
     
+    # Normalize overrides: clean description keys and coerce to positive floats
+    if overrides:
+        try:
+            overrides = {
+                _clean_description(str(k)).lower(): float(v)
+                for k, v in overrides.items()
+                if v is not None and float(v) > 0
+            }
+        except Exception:
+            # If any issue occurs, fall back to empty overrides to avoid breaking generation
+            overrides = {}
+    
     last_df = _prepare_last_month_df(last_month_records, last_month_str)
-    historical_stats = _get_historical_bucket_stats(history_df)
+    # Preserve last month's visual order for sorting carried rows later
+    last_order_map: Dict[str, int] = {}
+    for idx, rec in enumerate(last_month_records):
+        d = _clean_description(str((rec.get("description") or rec.get("Description") or "").strip()))
+        if d and d not in last_order_map:
+            last_order_map[d] = idx
     
     # Predict carry-over using classifier
     carry_proba = _positive_class_proba(clf, last_df)
     last_df = last_df.copy()
     last_df["carry_proba"] = carry_proba
-    carried_df = last_df[last_df["carry_proba"] >= 0.2].copy()  # 85% carry-over target
+    # Use provided threshold from UI/backend (default 0.2)
+    try:
+        thr = float(carry_threshold)
+    except Exception:
+        thr = 0.2
+    thr = max(0.0, min(1.0, thr))
+    carried_df = last_df[last_df["carry_proba"] >= thr].copy()
     
     result_rows = []
     
@@ -1299,10 +1344,23 @@ def _generate_next_month_core(
                 final_buckets["61_90"],
                 int(prev_buckets.get("31_60", 0) * 0.9)
             )
-            # For 90+, cap relative to prior 61-90 and retained prior 90+
-            cap_90 = int(prev_buckets.get("61_90", 0) * 0.9 + prev_buckets.get("90_plus", 0) * 0.95)
+            # For 90+, cap relative to prior (61-90 + 90+) at 90%
+            cap_90 = int((prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)) * 0.9)
             final_buckets["90_plus"] = min(final_buckets["90_plus"], cap_90)
             
+            # Apply override for 0-30 if provided for this carried description
+            desc_clean = _clean_description(desc).lower()
+            if overrides and desc_clean in overrides:
+                override_val = max(0, int(round(float(overrides[desc_clean]))))
+                # Never exceed previous month's CURRENT (same or less rule)
+                cap_prev_current = int(prev_buckets.get("current", 0))
+                final_buckets["0_30"] = min(override_val, cap_prev_current)
+                # Re-apply non-increase caps for older buckets relative to their sources
+                final_buckets["31_60"] = min(final_buckets["31_60"], int(prev_buckets.get("0_30", 0) * 0.9))
+                final_buckets["61_90"] = min(final_buckets["61_90"], int(prev_buckets.get("31_60", 0) * 0.9))
+                cap_90_recalc = int((prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)) * 0.9)
+                final_buckets["90_plus"] = min(final_buckets["90_plus"], cap_90_recalc)
+
             # CRITICAL: Calculate total as sum of aged buckets only
             aged_sum = final_buckets["0_30"] + final_buckets["31_60"] + final_buckets["61_90"] + final_buckets["90_plus"]
             final_buckets["current"] = aged_sum  # ENFORCE: Current = Total = aged sum
@@ -1314,8 +1372,65 @@ def _generate_next_month_core(
                     "aging": {k: float(v) for k, v in final_buckets.items()},
                     "predicted": True,
                     "total": float(aged_sum),  # Total = sum of aged buckets only
+                    # Flags
+                    "protected_0_30": bool(overrides and desc_clean in overrides),
+                    "is_override": bool(overrides and desc_clean in overrides),
                 })
     
+    # Add rows for any override descriptions that classifier did NOT carry over
+    if overrides:
+        carried_descs = set(carried_df["description"].tolist()) if not carried_df.empty else set()
+        already_emitted = {r["description"] for r in result_rows}
+        # Convert already_emitted to cleaned lowercase for comparison
+        already_emitted_clean = {_clean_description(d).lower() for d in already_emitted}
+        missing_override_descs = [d for d in overrides.keys() if d not in already_emitted_clean]
+        if missing_override_descs:
+            for desc in missing_override_descs:
+                # Find previous row for this description (need to match against cleaned descriptions)
+                last_df_clean = last_df.copy()
+                last_df_clean["description_clean"] = last_df_clean["description"].apply(lambda x: _clean_description(x).lower())
+                prev_rows = last_df_clean[last_df_clean["description_clean"] == desc]
+                if prev_rows.empty:
+                    continue
+                row = prev_rows.iloc[0]
+                prev_buckets = {
+                    "current": row.get("current", 0),
+                    "0_30": row.get("0_30", 0),
+                    "31_60": row.get("31_60", 0),
+                    "61_90": row.get("61_90", 0),
+                    "90_plus": row.get("90_plus", 0)
+                }
+                prev_total = float(row.get("total", 0)) if "total" in row else (
+                    float(prev_buckets["0_30"] + prev_buckets["31_60"] + prev_buckets["61_90"] + prev_buckets["90_plus"]) )
+                is_small = prev_total < 1000
+                # Use the same aging simulation as carried rows to follow learned trend
+                aged_buckets = _simulate_realistic_aging(prev_buckets, rng, is_small)
+                # Inject override for 0-30, capped at previous current (same or less rule)
+                override_val = max(0, int(round(float(overrides[desc]))))
+                cap_prev_current = int(prev_buckets.get("current", 0))
+                aged_buckets["0_30"] = min(override_val, cap_prev_current)
+                # Recalculate aged total and set current accordingly
+                aged_sum = aged_buckets["0_30"] + aged_buckets["31_60"] + aged_buckets["61_90"] + aged_buckets["90_plus"]
+                final_buckets = {
+                    "0_30": int(max(0, aged_buckets["0_30"])),
+                    "31_60": int(max(0, min(aged_buckets["31_60"], int(prev_buckets.get("0_30", 0) * 0.9)))),
+                    "61_90": int(max(0, min(aged_buckets["61_90"], int(prev_buckets.get("31_60", 0) * 0.9)))),
+                    "90_plus": int(max(0, min(aged_buckets["90_plus"], int((prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)) * 0.9))))
+                }
+                aged_sum = final_buckets["0_30"] + final_buckets["31_60"] + final_buckets["61_90"] + final_buckets["90_plus"]
+                final_buckets["current"] = aged_sum
+                if aged_sum > 0:
+                    result_rows.append({
+                        "description": desc,
+                        "month": next_month_str,
+                        "aging": {k: float(v) for k, v in final_buckets.items()},
+                        "predicted": True,
+                        "total": float(aged_sum),
+                        # Flags
+                        "protected_0_30": True,
+                        "is_override": True,
+                    })
+
     # Add new descriptions if needed to reach target
     current_total = sum(r["total"] for r in result_rows)
     remaining = target_total - current_total
@@ -1396,6 +1511,9 @@ def _generate_next_month_core(
                                 "aging": {k: float(v) for k, v in aged_buckets.items()},
                                 "predicted": True,
                                 "total": float(aged_sum),
+                                # New descriptions added by model to reach target are not overrides
+                                "protected_0_30": True,  # protect from scaling, but not an override
+                                "is_override": False,
                             })
     
     # Consolidate small rows to reduce count and add variety
@@ -1413,8 +1531,15 @@ def _generate_next_month_core(
     # CRITICAL: Final enforcement of exact row totals
     result_rows = _force_exact_row_totals(result_rows)
     
-    # Sort by total descending like historical sheets
-    result_rows.sort(key=lambda x: x["total"], reverse=True)
+    # Sort to match previous month's order; append new descriptions at bottom
+    # Preserve insertion order among new descriptions
+    insertion_pos = {r["description"]: i for i, r in enumerate(result_rows)}
+    def _order_key(r: Dict[str, Any]):
+        desc = r["description"]
+        if desc in last_order_map:
+            return (0, last_order_map[desc])
+        return (1, insertion_pos[desc])
+    result_rows.sort(key=_order_key)
     
     # Don't add grand totals row here - let frontend handle totals display
     # Grand totals will be added only when saving to CSV
@@ -1429,6 +1554,8 @@ def generate_next_month(
     next_month_str: str,
     target_total: float,
     history_df: Optional[pd.DataFrame] = None,
+    overrides: Optional[Dict[str, float]] = None,
+    carry_threshold: float = 0.2,
 ) -> List[Dict[str, Any]]:
     clf, regr = _load_models(classifier_path, regressor_path)
     return _generate_next_month_core(
@@ -1439,6 +1566,8 @@ def generate_next_month(
         next_month_str,
         target_total,
         history_df,
+        overrides,
+        carry_threshold,
     )
 
 
@@ -1450,6 +1579,8 @@ def generate_next_month_with_models(
     next_month_str: str,
     target_total: float,
     history_df: Optional[pd.DataFrame] = None,
+    overrides: Optional[Dict[str, float]] = None,
+    carry_threshold: float = 0.2,
 ) -> List[Dict[str, Any]]:
     return _generate_next_month_core(
         clf,
@@ -1459,6 +1590,8 @@ def generate_next_month_with_models(
         next_month_str,
         target_total,
         history_df,
+        overrides,
+        carry_threshold,
     )
 
 
