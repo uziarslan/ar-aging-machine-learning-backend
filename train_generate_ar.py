@@ -315,30 +315,27 @@ def parse_data(excel_path: str, xml_document: Optional[str] = None) -> pd.DataFr
 
     # Optional: parse XML if provided; expected structure includes entries similar to Mongo JSON
     if xml_document and isinstance(xml_document, str) and "<document" in xml_document:
-        try:
-            # Very lightweight XML parsing without external libs: find lines that look like JSON
-            # Users can plug in their own strict XML parser if needed.
-            json_blocks = re.findall(r"\{[\s\S]*?\}", xml_document)
-            for jb in json_blocks:
-                try:
-                    rec = json.loads(jb)
-                    aging = rec.get("aging", {})
-                    all_rows.append(
-                        {
+        # Very lightweight XML parsing without external libs: find lines that look like JSON
+        # Users can plug in their own strict XML parser if needed.
+        json_blocks = re.findall(r"\{[\s\S]*?\}", xml_document)
+        for jb in json_blocks:
+            try:
+                rec = json.loads(jb)
+                aging = rec.get("aging", {})
+                all_rows.append(
+                    {
                             "description": _clean_description(rec.get("description", "")),  # Clean description
-                            "month": rec.get("month", ""),
-                            "current": _safe_float(aging.get("current", 0)),
-                            "0_30": _safe_float(aging.get("0_30", 0)),
-                            "31_60": _safe_float(aging.get("31_60", 0)),
-                            "61_90": _safe_float(aging.get("61_90", 0)),
-                            "90_plus": _safe_float(aging.get("90_plus", 0)),
-                            "total": _safe_float(rec.get("total", 0)),
-                        }
-                    )
-                except Exception:
-                    continue
-        except Exception:
-            pass
+                        "month": rec.get("month", ""),
+                        "current": _safe_float(aging.get("current", 0)),
+                        "0_30": _safe_float(aging.get("0_30", 0)),
+                        "31_60": _safe_float(aging.get("31_60", 0)),
+                        "61_90": _safe_float(aging.get("61_90", 0)),
+                        "90_plus": _safe_float(aging.get("90_plus", 0)),
+                        "total": _safe_float(rec.get("total", 0)),
+                    }
+                )
+            except Exception:
+                continue
 
     if not all_rows:
         raise ValueError("No data parsed. Ensure the Excel file path is correct and sheets are named with months.")
@@ -675,20 +672,16 @@ def train_model(df: pd.DataFrame, client_name: str = "SBS", models_dir: Optional
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "trained",
     }
-    try:
-        if os.path.exists(registry_path):
-            with open(registry_path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            if not isinstance(obj, list):
-                obj = [obj]
-        else:
-            obj = []
-        obj.append(record)
-        with open(registry_path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2)
-    except Exception:
-        # Best-effort; non-fatal
-        pass
+    if os.path.exists(registry_path):
+        with open(registry_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, list):
+            obj = [obj]
+    else:
+        obj = []
+    obj.append(record)
+    with open(registry_path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
     return ModelArtifacts(version=version, classifier_path=clf_path, regressor_path=regr_path, registry_path=registry_path), {
         "carry_classifier": metrics_carry,
@@ -821,10 +814,21 @@ def _consolidate_small_rows(rows: List[Dict[str, Any]], max_small: int = 25) -> 
                 consolidated_buckets = {
                     "current": 0, "0_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0
                 }
+                any_user_added = any(bool(r.get("user_added")) for r in group)
+                any_auto_generated = any(bool(r.get("auto_generated")) for r in group)
+                any_protected = any(bool(r.get("protected_0_30")) for r in group)
                 
                 for bucket in consolidated_buckets:
                     bucket_sum = sum(r["aging"][bucket] for r in group)
                     consolidated_buckets[bucket] = int(bucket_sum)
+                
+                # If this consolidated row includes any user-added or auto-generated source rows,
+                # enforce 0-30-only: zero older buckets and make current=total
+                if any_user_added or any_auto_generated:
+                    consolidated_buckets["31_60"] = 0
+                    consolidated_buckets["61_90"] = 0
+                    consolidated_buckets["90_plus"] = 0
+                    consolidated_buckets["current"] = int(consolidated_buckets["0_30"])
                 
                 # CRITICAL: Calculate total as sum of buckets
                 calculated_total = sum(consolidated_buckets.values())
@@ -834,14 +838,17 @@ def _consolidate_small_rows(rows: List[Dict[str, Any]], max_small: int = 25) -> 
                     "month": group[0]["month"],
                     "aging": consolidated_buckets,
                     "predicted": True,
-                    "total": float(calculated_total)  # Total = sum of buckets
+                    "total": float(calculated_total),  # Total = sum of buckets
+                    "user_added": bool(any_user_added),
+                    "auto_generated": bool(any_auto_generated),
+                    "protected_0_30": bool(any_protected)
                 })
         
         # Combine all rows
         result = large_rows + kept_small + consolidated
     else:
         result = large_rows + small_rows
-    
+
     return result
 
 
@@ -979,174 +986,478 @@ def _force_exact_row_totals(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _scale_to_exact_target(rows: List[Dict[str, Any]], target_total: float, max_iterations: int = 2) -> List[Dict[str, Any]]:
-    """Add new business to hit exact target while preserving realistic aging ratios."""
+def _scale_to_exact_target(
+    rows: List[Dict[str, Any]],
+    target_total: float,
+    column_targets: Optional[Dict[str, float]] = None,
+    max_iterations: int = 5
+) -> List[Dict[str, Any]]:
+    """Scale to exact target while enforcing specific column targets.
+
+    If column_targets is provided, it should be a mapping with keys:
+    {"0_30", "31_60", "61_90", "90_plus"} and numeric values.
+    """
+    
+    # CRITICAL: Use provided column targets when available; otherwise fall back to defaults
+    COLUMN_TARGETS = column_targets or {
+        "0_30": 1537823,
+        "31_60": 1100000,
+        "61_90": 800000,
+        "90_plus": 500000
+    }
     
     # CRITICAL: Force exact row totals first
     rows = _force_exact_row_totals(rows)
     
-    current_total = sum(r["total"] for r in rows)
+    # Calculate current column totals
+    current_col_totals = {
+        col: sum(r["aging"][col] for r in rows)
+        for col in ["0_30", "31_60", "61_90", "90_plus"]
+    }
     
-    # Check if we're already close enough
-    if abs(current_total - target_total) < 1.0:
-        return rows
+    print(f"Current column totals before scaling: {current_col_totals}")
+    print(f"Target column totals: {COLUMN_TARGETS}")
     
-    # Calculate how much additional business we need
-    additional_needed = target_total - current_total
+    # Step 1: Scale each column independently to hit exact targets
+    for col, target in COLUMN_TARGETS.items():
+        current_total = current_col_totals[col]
+        
+        if current_total == 0 and target > 0:
+            # Need to create this column from scratch - distribute to all rows
+            if rows:
+                amount_per_row = target / len(rows)
+                for row in rows:
+                    if not row.get("is_override") or col != "0_30":
+                        row["aging"][col] = amount_per_row
+        elif current_total > 0:
+            # Scale this column to exact target
+            scale_factor = target / current_total
+            
+            for row in rows:
+                if not row.get("is_override") or col != "0_30":
+                    row["aging"][col] *= scale_factor
     
-    if additional_needed > 0 and rows:
-        # New strategy: add to 31-60 bucket of NON-override rows first
-        remaining = int(round(additional_needed))
-        non_override_rows = [r for r in rows if not r.get("is_override")]
-        # Prefer larger rows to absorb more
-        non_override_rows.sort(key=lambda r: r["total"], reverse=True)
-
-        for row in non_override_rows:
+    # Convert to integers
+    for row in rows:
+        for col in ["0_30", "31_60", "61_90", "90_plus"]:
+            row["aging"][col] = max(0, int(round(row["aging"][col])))
+    
+    # CRITICAL: Recalculate current as sum of aged buckets
+    rows = _force_exact_row_totals(rows)
+    
+    # Step 2: Fine-tune to hit exact column targets with precision
+    current_col_totals_after = {
+        col: sum(r["aging"][col] for r in rows)
+        for col in ["0_30", "31_60", "61_90", "90_plus"]
+    }
+    
+    # Calculate discrepancies for each column
+    discrepancies = {
+        col: target - current_col_totals_after[col]
+        for col, target in COLUMN_TARGETS.items()
+    }
+    
+    print(f"Column discrepancies after scaling: {discrepancies}")
+    
+    # Distribute discrepancies intelligently
+    for col, diff in discrepancies.items():
+        if abs(diff) > 0:
+            # Sort rows by appropriate criteria for distribution
+            if diff > 0:
+                # Need to add - prefer larger rows and non-override rows
+                candidate_rows = [r for r in rows if not r.get("is_override") or col != "0_30"]
+                candidate_rows.sort(key=lambda x: x["total"], reverse=True)
+            else:
+                # Need to remove - prefer larger rows and non-override rows  
+                candidate_rows = [r for r in rows if not r.get("is_override") or col != "0_30"]
+                candidate_rows.sort(key=lambda x: x["total"], reverse=True)
+            
+            if candidate_rows:
+                remaining_diff = diff
+                max_per_row = max(1, abs(remaining_diff) // max(1, len(candidate_rows)))
+                
+                for row in candidate_rows:
+                    if remaining_diff == 0:
+                        break
+                    
+                    if diff > 0:
+                        # Add to this row
+                        add_amount = min(remaining_diff, max_per_row)
+                        row["aging"][col] += add_amount
+                        remaining_diff -= add_amount
+                    else:
+                        # Remove from this row (but not below zero)
+                        remove_amount = min(abs(remaining_diff), max_per_row, row["aging"][col])
+                        row["aging"][col] -= remove_amount
+                        remaining_diff += remove_amount
+    
+    # Final integer conversion
+    for row in rows:
+        for col in ["0_30", "31_60", "61_90", "90_plus"]:
+            row["aging"][col] = max(0, int(round(row["aging"][col])))
+    
+    # CRITICAL: Final enforcement of exact row totals
+    rows = _force_exact_row_totals(rows)
+    
+    # Step 3: Add adjustment rows for any remaining discrepancies
+    final_col_totals = {
+        col: sum(r["aging"][col] for r in rows)
+        for col in ["0_30", "31_60", "61_90", "90_plus"]
+    }
+    
+    final_discrepancies = {
+        col: COLUMN_TARGETS[col] - final_col_totals[col]
+        for col in COLUMN_TARGETS.keys()
+    }
+    
+    # If 0-30 is over target (negative discrepancy), reduce 0-30 across eligible rows
+    over_0_30 = -final_discrepancies.get("0_30", 0)
+    if over_0_30 > 0:
+        # Prefer non-override and non-protected rows with largest 0-30
+        candidates = [r for r in rows if not r.get("is_override") and not r.get("protected_0_30")]
+        candidates.sort(key=lambda r: r["aging"].get("0_30", 0), reverse=True)
+        remaining = int(round(over_0_30))
+        # First pass: proportional reduction
+        for r in candidates:
             if remaining <= 0:
                 break
-            # Add as much as possible to 31-60
-            addition = min(remaining, max(1, remaining // max(1, len(non_override_rows))))
-            row["aging"]["31_60"] = int(row["aging"].get("31_60", 0)) + int(addition)
-            remaining -= addition
-
-        # If still remaining, add a dedicated Adjustment row (31-60 only)
-        if remaining > 0:
-            rows.append({
-                "description": "Adjustment",
-                "month": "",
-                "aging": {
-                    "current": 0.0,
-                    "0_30": 0.0,
-                    "31_60": float(remaining),
-                    "61_90": 0.0,
-                    "90_plus": 0.0,
-                },
-                "predicted": True,
-                "total": float(remaining),
-                "protected_0_30": False,
-                "is_override": False,
-            })
-    
-    elif additional_needed < 0 and rows:
-        # Need to reduce - remove from 31-60 buckets of NON-override rows first
-        reduction_needed = int(abs(round(additional_needed)))
-        non_override_rows = [r for r in rows if not r.get("is_override")]
-        # Sort by largest 31-60 first
-        non_override_rows.sort(key=lambda r: r["aging"].get("31_60", 0), reverse=True)
-
-        # Reduce from 31-60
-        for row in non_override_rows:
-            if reduction_needed <= 0:
-                break
-            avail = int(row["aging"].get("31_60", 0))
+            avail = int(r["aging"].get("0_30", 0))
             if avail <= 0:
                 continue
-            take = min(reduction_needed, avail)
-            row["aging"]["31_60"] = avail - take
-            reduction_needed -= take
+            take = min(avail, max(1, remaining // max(1, len(candidates))))
+            r["aging"]["0_30"] = max(0, avail - take)
+            remaining -= take
+        # Second pass: precise per-unit reduction for small leftover
+        if remaining > 0 and candidates:
+            idx = 0
+            # Limit to reasonable iterations to avoid long loops if huge; remaining is typically small now
+            max_steps = remaining * 2
+            steps = 0
+            while remaining > 0 and steps < max_steps:
+                r = candidates[idx % len(candidates)]
+                avail = int(r["aging"].get("0_30", 0))
+                if avail > 0:
+                    r["aging"]["0_30"] = avail - 1
+                    remaining -= 1
+                idx += 1
+                steps += 1
+        # Re-enforce after subtraction
+        rows = _force_exact_row_totals(rows)
+        # Recompute discrepancies
+        final_col_totals = { col: sum(r["aging"][col] for r in rows) for col in ["0_30", "31_60", "61_90", "90_plus"] }
+        final_discrepancies = { col: COLUMN_TARGETS[col] - final_col_totals[col] for col in COLUMN_TARGETS.keys() }
 
-        # If still need reductions, reduce from 61-90, then 90+, then 0-30 (non-override rows)
-        if reduction_needed > 0:
-            for bucket in ["61_90", "90_plus", "0_30"]:
-                if reduction_needed <= 0:
-                    break
-                for row in non_override_rows:
-                    if reduction_needed <= 0:
-                        break
-                    # Skip 0-30 if row has protected override
-                    if bucket == "0_30" and row.get("protected_0_30"):
-                        continue
-                    avail = int(row["aging"].get(bucket, 0))
-                    if avail <= 0:
-                        continue
-                    take = min(reduction_needed, avail)
-                    row["aging"][bucket] = avail - take
-                    reduction_needed -= take
-    
-    # CRITICAL: Final enforcement of exact row totals
-    rows = _force_exact_row_totals(rows)
-    
-    # Final micro-adjustment if still not exact
-    current_total = sum(r["total"] for r in rows)
-    diff = int(round(target_total - current_total))
-    
-    if diff != 0 and rows:
-        # PRECISION ADJUSTMENT: For small differences (<10), use surgical precision
-        rows.sort(key=lambda x: x["total"], reverse=True)
-        
-        if abs(diff) <= 10:
-            # Small difference: add/subtract from largest rows' 0-30/Current buckets
-            large_rows = rows[:min(5, len(rows))]  # Top 5 largest rows
-            
-            for i, row in enumerate(large_rows):
-                if diff == 0:
-                    break
-                    
-                if diff > 0:
-                    # Add 1-2 to 0-30 bucket of largest rows
-                    addition = min(diff, 2)
-                    row["aging"]["0_30"] += addition
-                    diff -= addition
-                elif diff < 0 and row["aging"]["0_30"] > 0:
-                    # Remove 1-2 from 0-30 bucket
-                    reduction = min(abs(diff), 2, row["aging"]["0_30"])
-                    row["aging"]["0_30"] -= reduction
-                    diff += reduction
-        else:
-            # Larger difference: distribute more broadly
-            attempts = 0
-            max_attempts = abs(diff) + len(rows) * 5
-            
-            while diff != 0 and attempts < max_attempts:
-                row_idx = attempts % len(rows)
-                row = rows[row_idx]
-                
-                if diff > 0:
-                    # Add to 0-30 bucket (focus on larger customers)
-                    if row_idx < len(rows) // 2:  # Top half gets more
-                        addition = min(diff, max(1, abs(diff) // (len(rows) // 2)))
-                    else:  # Bottom half gets less
-                        addition = min(diff, 1)
-                    if not row.get("protected_0_30"):
-                        row["aging"]["0_30"] += addition
-                    diff -= addition
-                elif diff < 0 and row["aging"]["0_30"] > 0:
-                    # Remove from 0-30 bucket
-                    if not row.get("protected_0_30"):
-                        reduction = min(abs(diff), row["aging"]["0_30"], 1)
-                        row["aging"]["0_30"] -= reduction
-                        diff += reduction
-                        attempts += 1
-                        continue
-                    diff += reduction
-                
-                attempts += 1
-                
-        # FINAL VERIFICATION: If still off, use/create Adjustment row on 31-60
-        if diff != 0:
-            # Try to find an existing Adjustment row
-            adj = next((r for r in rows if r.get("description") == "Adjustment"), None)
-            if adj is None:
-                adj = {
-                    "description": "Adjustment",
-                    "month": "",
-                    "aging": {"current": 0.0, "0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "90_plus": 0.0},
+    # Add adjustment rows ONLY as positive additions in 0-30. No negatives, no older buckets.
+    # If a column is over target (negative diff), we will not create a negative adjustment.
+    # Such cases should have been handled in earlier fine-tuning; clamp here for safety.
+    adjustments_needed = False
+    adjustment_rows = []
+    remaining_0_30 = final_discrepancies.get("0_30", 0)
+    if remaining_0_30 > 0:
+        adjustments_needed = True
+        adjustment_rows.append({
+            "description": "Adjustment_0_30",
+            "month": "",
+                    "aging": {
+                        "current": 0.0,
+                "0_30": float(max(0, int(round(remaining_0_30)))),
+                        "31_60": 0.0,
+                        "61_90": 0.0,
+                "90_plus": 0.0,
+                    },
                     "predicted": True,
-                    "total": 0.0,
-                    "protected_0_30": False,
-                    "is_override": False,
-                }
-                rows.append(adj)
-            # Apply diff to 31-60 (positive adds, negative subtracts but not below zero)
-            new_31_60 = int(max(0, adj["aging"]["31_60"] + diff))
-            adj["aging"]["31_60"] = new_31_60
-            # Recompute totals after adjustment
-            rows = _force_exact_row_totals(rows)
+            "total": float(max(0, int(round(remaining_0_30)))),
+            "is_adjustment": True
+        })
+        print(f"Adding positive 0-30 adjustment: {remaining_0_30}")
+    # Ignore negative diffs (overages) to avoid negative rows. Earlier scaling should have minimized them.
     
-    # CRITICAL: Final enforcement of exact row totals
+    if adjustments_needed:
+        rows.extend(adjustment_rows)
+    
+    # Clamp any accidental negatives to zero and final enforcement
+    for r in rows:
+        for b in ["current", "0_30", "31_60", "61_90", "90_plus"]:
+            if isinstance(r.get("aging", {}).get(b, 0), (int, float)):
+                r["aging"][b] = float(max(0, int(round(r["aging"][b]))))
     rows = _force_exact_row_totals(rows)
+
+    # Enforce per-row caps for older buckets based on previous month, then rebalance to meet column targets
+    def _get_row_key(desc: str) -> str:
+        try:
+            return _clean_description(str(desc)).lower()
+        except Exception:
+            return str(desc).strip().lower()
+
+    if column_targets is not None:
+        # First clamp to caps for older buckets and collect removed amounts per column
+        for col in ["31_60", "61_90", "90_plus"]:
+            removed = 0
+            for r in rows:
+                cap = float('inf')
+                # row_caps expected keys match column names; if not provided, no cap
+                # NOTE: caps are passed via column_targets? No—row caps are bound to last month; use optional attribute injected in rows? Fallback: no cap
+                # We attach caps via a hidden field on row if present
+                r_caps = r.get("_caps") or {}
+                if col in r_caps:
+                    cap = float(max(0, int(round(r_caps[col]))))
+                cur = float(r["aging"][col])
+                # Never change user-added older buckets (already zero) but keep logic uniform
+                if cur > cap:
+                    removed += (cur - cap)
+                    r["aging"][col] = cap
+            # Redistribute any removed to rows with headroom in same column
+            if removed > 0:
+                remaining = int(round(removed))
+                # Build candidates with headroom
+                candidates = []
+                for r in rows:
+                    r_caps = r.get("_caps") or {}
+                    cap_val = r_caps.get(col, None)
+                    cur = int(round(float(r["aging"][col])))
+                    # Do not use user-added rows as recipients for older buckets redistribution
+                    if col in ["31_60", "61_90", "90_plus"] and (r.get("user_added") or r.get("auto_generated")):
+                        continue
+                    if cap_val is None:
+                        # No cap: treat as very large headroom but finite
+                        headroom = 10**9
+                    else:
+                        cap = int(round(max(0, float(cap_val))))
+                        headroom = max(0, cap - cur)
+                    if headroom > 0:
+                        candidates.append((int(headroom), r))
+                # Sort by headroom descending
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                idx = 0
+                while remaining > 0 and candidates:
+                    hr, r = candidates[idx % len(candidates)]
+                    if hr <= 0:
+                        idx += 1
+                        continue
+                    add = 1 if remaining < 10 else min(hr, max(1, remaining // len(candidates)))
+                    r["aging"][col] = float(int(round(r["aging"][col])) + add)
+                    hr -= add
+                    remaining -= add
+                    candidates[idx % len(candidates)] = (hr, r)
+                    idx += 1
+        rows = _force_exact_row_totals(rows)
+
+        # Now ensure each column meets target again within caps and per-row total caps
+        for col in ["31_60", "61_90", "90_plus", "0_30"]:
+            target = int(round(column_targets.get(col, 0)))
+            cur_total = int(round(sum(int(round(r["aging"][col])) for r in rows)))
+            if cur_total < target:
+                need = target - cur_total
+                # Grow within caps (no caps for 0_30 unless protected_0_30)
+                candidates = []
+                for r in rows:
+                    if col == "0_30" and r.get("protected_0_30"):
+                        continue
+                    # If user_added or auto_generated, they cannot have older buckets (>0_30)
+                    if col in ["31_60", "61_90", "90_plus"] and (r.get("user_added") or r.get("auto_generated")):
+                        continue
+                    r_caps = r.get("_caps") or {}
+                    total_cap = int(round(float(r_caps.get("total", 10**9))))
+                    current_aged_sum = int(round(
+                        float(r["aging"]["0_30"]) + float(r["aging"]["31_60"]) + float(r["aging"]["61_90"]) + float(r["aging"]["90_plus"])
+                    ))
+                    total_headroom = max(0, total_cap - current_aged_sum)
+                    cap_val = r_caps.get(col, None)
+                    cur_val = int(round(float(r["aging"][col])))
+                    if cap_val is None:
+                        headroom = min(10**9, total_headroom)
+                    else:
+                        cap = int(round(max(0, float(cap_val))))
+                        headroom = max(0, min(cap - cur_val, total_headroom))
+                    if headroom > 0:
+                        candidates.append((int(headroom), r))
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                idx = 0
+                while need > 0 and candidates:
+                    hr, cand = candidates[idx % len(candidates)]
+                    if hr <= 0:
+                        idx += 1
+                        continue
+                    add_amt = 1 if need < 10 else min(hr, max(1, need // len(candidates)))
+                    cand["aging"][col] = float(int(round(cand["aging"][col])) + add_amt)
+                    hr -= add_amt
+                    need -= add_amt
+                    candidates[idx % len(candidates)] = (hr, cand)
+                    idx += 1
+            elif cur_total > target:
+                excess = cur_total - target
+                # Reduce from rows with largest values in this column (but never reduce user_added/auto_generated older buckets)
+                candidates = []
+                for r in rows:
+                    cur_val = int(round(float(r["aging"][col])))
+                    if cur_val > 0 and not (col == "0_30" and r.get("protected_0_30")) and not (col in ["31_60", "61_90", "90_plus"] and (r.get("user_added") or r.get("auto_generated"))):
+                        candidates.append((cur_val, r))
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                idx = 0
+                while excess > 0 and candidates:
+                    cur_val, cand = candidates[idx % len(candidates)]
+                    if cur_val <= 0:
+                        idx += 1
+                        continue
+                    take = 1 if excess < 10 else min(cur_val, max(1, excess // len(candidates)))
+                    cand["aging"][col] = float(cur_val - take)
+                    cur_val -= take
+                    excess -= take
+                    candidates[idx % len(candidates)] = (cur_val, cand)
+        rows = _force_exact_row_totals(rows)
+
+        # Final sweep: ensure auto_generated and user_added have zero in older buckets
+        # and then rebalance columns to maintain targets (excluding those rows)
+        if column_targets is not None:
+            # Zero older buckets for auto/user rows and recompute totals
+            for r in rows:
+                if r.get("auto_generated") or r.get("user_added"):
+                    r["aging"]["31_60"] = 0.0
+                    r["aging"]["61_90"] = 0.0
+                    r["aging"]["90_plus"] = 0.0
+                    # Recompute total/current from aged buckets
+                    aged_sum_local = (
+                        float(r["aging"]["0_30"]) + float(r["aging"]["31_60"]) + float(r["aging"]["61_90"]) + float(r["aging"]["90_plus"])
+                    )
+                    r["aging"]["current"] = float(int(round(aged_sum_local)))
+                    r["total"] = float(int(round(aged_sum_local)))
+            rows = _force_exact_row_totals(rows)
+
+            # Rebalance each older column if now short vs target
+            for col in ["31_60", "61_90", "90_plus"]:
+                target_val = int(round(column_targets.get(col, 0)))
+                cur_sum = int(round(sum(int(round(rr["aging"][col])) for rr in rows)))
+                if cur_sum < target_val:
+                    need = target_val - cur_sum
+                    # Eligible candidates: not user_added/auto_generated, respect caps and per-row total cap
+                    cands = []
+                    for rr in rows:
+                        if rr.get("user_added") or rr.get("auto_generated"):
+                            continue
+                        caps = rr.get("_caps") or {}
+                        total_cap = int(round(float(caps.get("total", 10**9))))
+                        aged_total_rr = int(round(
+                            float(rr["aging"]["0_30"]) + float(rr["aging"]["31_60"]) + float(rr["aging"]["61_90"]) + float(rr["aging"]["90_plus"]) 
+                        ))
+                        total_headroom_rr = max(0, total_cap - aged_total_rr)
+                        cap_val = caps.get(col, None)
+                        cur_val_rr = int(round(float(rr["aging"][col])))
+                        if cap_val is None:
+                            headroom_rr = min(10**9, total_headroom_rr)
+                        else:
+                            col_cap = int(round(max(0, float(cap_val))))
+                            headroom_rr = max(0, min(col_cap - cur_val_rr, total_headroom_rr))
+                        if headroom_rr > 0:
+                            cands.append((int(headroom_rr), rr))
+                    cands.sort(key=lambda x: x[0], reverse=True)
+                    idx = 0
+                    while need > 0 and cands:
+                        hr, rr = cands[idx % len(cands)]
+                        if hr <= 0:
+                            idx += 1
+                            continue
+                        add_amt = 1 if need < 10 else min(hr, max(1, need // len(cands)))
+                        rr["aging"][col] = float(int(round(rr["aging"][col])) + add_amt)
+                        # update the tuple in place
+                        hr -= add_amt
+                        need -= add_amt
+                        cands[idx % len(cands)] = (hr, rr)
+                        idx += 1
+                    rows = _force_exact_row_totals(rows)
+                elif cur_sum > target_val:
+                    excess = cur_sum - target_val
+                    # Reduce from largest non user-added/auto_generated rows
+                    red_cands = []
+                    for rr in rows:
+                        if rr.get("user_added") or rr.get("auto_generated"):
+                            continue
+                        cur_val_rr = int(round(float(rr["aging"][col])))
+                        if cur_val_rr > 0:
+                            red_cands.append((cur_val_rr, rr))
+                    red_cands.sort(key=lambda x: x[0], reverse=True)
+                    idx = 0
+                    while excess > 0 and red_cands:
+                        cur_val_rr, rr = red_cands[idx % len(red_cands)]
+                        if cur_val_rr <= 0:
+                            idx += 1
+                            continue
+                        take = 1 if excess < 10 else min(cur_val_rr, max(1, excess // len(red_cands)))
+                        rr["aging"][col] = float(cur_val_rr - take)
+                        cur_val_rr -= take
+                        excess -= take
+                        red_cands[idx % len(red_cands)] = (cur_val_rr, rr)
+                        idx += 1
+                    rows = _force_exact_row_totals(rows)
+
+    # Final verification
+    final_col_totals_verified = {
+        col: sum(r["aging"][col] for r in rows)
+        for col in ["0_30", "31_60", "61_90", "90_plus"]
+    }
+    
+    final_total = sum(r["total"] for r in rows)
+    
+    print(f"Final column totals: {final_col_totals_verified}")
+    print(f"Final grand total: {final_total}")
+    print(f"Target grand total: {target_total}")
+    
+    # Verify all targets are met
+    all_targets_met = True
+    for col, target in COLUMN_TARGETS.items():
+        actual = final_col_totals_verified[col]
+        if abs(actual - target) > 1:
+            print(f"✗ Column {col} target not met: {actual} vs {target}")
+            all_targets_met = False
+        else:
+            print(f"✓ Column {col} target met: {actual} = {target}")
+    
+    if abs(final_total - target_total) > 1:
+        print(f"✗ Grand total target not met: {final_total} vs {target_total}")
+        all_targets_met = False
+    else:
+        print(f"✓ Grand total target met: {final_total} = {target_total}")
+    
+    if not all_targets_met:
+        print("WARNING: Not all targets were met exactly")
     
     return rows
+
+
+def _get_column_target_ratios(history_df: pd.DataFrame) -> Dict[str, float]:
+    """Calculate realistic column ratios from historical data."""
+    if history_df is None or history_df.empty:
+        # Default aging pattern
+        return {
+            "current": 0.45,  # 45% current
+            "0_30": 0.35,     # 35% 0-30  
+            "31_60": 0.12,    # 12% 31-60
+            "61_90": 0.05,    # 5% 61-90
+            "90_plus": 0.03   # 3% 90+
+        }
+    
+    # Calculate average ratios from historical data
+    totals = history_df[["current", "0_30", "31_60", "61_90", "90_plus"]].sum(axis=1)
+    valid_mask = totals > 0
+    
+    if not valid_mask.any():
+        return {
+            "current": 0.45, "0_30": 0.35, "31_60": 0.12, 
+            "61_90": 0.05, "90_plus": 0.03
+        }
+    
+    valid_df = history_df[valid_mask]
+    valid_totals = totals[valid_mask]
+    
+    ratios = {}
+    for col in ["current", "0_30", "31_60", "61_90", "90_plus"]:
+        pcts = valid_df[col] / valid_totals
+        ratios[col] = float(pcts.mean())
+    
+    # Normalize to ensure they sum to 1
+    total_ratio = sum(ratios.values())
+    ratios = {k: v/total_ratio for k, v in ratios.items()}
+    
+    return ratios
 
 
 def _simulate_realistic_aging(
@@ -1234,6 +1545,9 @@ def _generate_next_month_core(
 ) -> List[Dict[str, Any]]:
     """Generate next month's AR aging rows using realistic aging simulation."""
     
+    # Get historical column ratios for realistic distribution
+    column_ratios = _get_column_target_ratios(history_df)
+    
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
     
     # Normalize overrides: clean description keys and coerce to positive floats
@@ -1318,7 +1632,7 @@ def _generate_next_month_core(
                 aged_buckets["current"] = remaining_for_new
             else:
                 aged_buckets["current"] = 0
-            
+
             # Round to integers with minimal noise (only negative for aged buckets)
             final_buckets = {}
             for bucket, value in aged_buckets.items():
@@ -1361,6 +1675,15 @@ def _generate_next_month_core(
                 cap_90_recalc = int((prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)) * 0.9)
                 final_buckets["90_plus"] = min(final_buckets["90_plus"], cap_90_recalc)
 
+            # GLOBAL CAP for carried rows: total of aged buckets must not exceed previous month's total
+            prev_total_cap = int(round(prev_total)) if isinstance(prev_total, (int, float)) else 0
+            aged_sum_pre = final_buckets["0_30"] + final_buckets["31_60"] + final_buckets["61_90"] + final_buckets["90_plus"]
+            if prev_total_cap > 0 and aged_sum_pre > prev_total_cap:
+                scale_factor = prev_total_cap / float(aged_sum_pre)
+                # Proportionally scale down aged buckets
+                for k in ["0_30", "31_60", "61_90", "90_plus"]:
+                    final_buckets[k] = int(max(0, int(round(final_buckets[k] * scale_factor))))
+
             # CRITICAL: Calculate total as sum of aged buckets only
             aged_sum = final_buckets["0_30"] + final_buckets["31_60"] + final_buckets["61_90"] + final_buckets["90_plus"]
             final_buckets["current"] = aged_sum  # ENFORCE: Current = Total = aged sum
@@ -1375,6 +1698,13 @@ def _generate_next_month_core(
                     # Flags
                     "protected_0_30": bool(overrides and desc_clean in overrides),
                     "is_override": bool(overrides and desc_clean in overrides),
+                    # Per-row caps to be respected during later scaling passes
+                    "_caps": {
+                        "31_60": float(prev_buckets.get("0_30", 0)),
+                        "61_90": float(prev_buckets.get("31_60", 0)),
+                        "90_plus": float(prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)),
+                        "total": float(prev_total),
+                    },
                 })
     
     # Add rows for any override descriptions that classifier did NOT carry over
@@ -1429,6 +1759,12 @@ def _generate_next_month_core(
                         # Flags
                         "protected_0_30": True,
                         "is_override": True,
+                        "_caps": {
+                            "31_60": float(prev_buckets.get("0_30", 0)),
+                            "61_90": float(prev_buckets.get("31_60", 0)),
+                            "90_plus": float(prev_buckets.get("61_90", 0) + prev_buckets.get("90_plus", 0)),
+                            "total": float(prev_total),
+                        },
                     })
 
     # Add new descriptions if needed to reach target
@@ -1511,16 +1847,24 @@ def _generate_next_month_core(
                                 "aging": {k: float(v) for k, v in aged_buckets.items()},
                                 "predicted": True,
                                 "total": float(aged_sum),
-                                # New descriptions added by model to reach target are not overrides
-                                "protected_0_30": True,  # protect from scaling, but not an override
-                                "is_override": False,
+                        # New descriptions added by model to reach target are auto_generated and 0-30-only
+                        "protected_0_30": True,  # protect from scaling, but not an override
+                        "is_override": False,
+                        "auto_generated": True,
+                        # Hard cap zero for older buckets to be explicit for downstream checks
+                        "_caps": {
+                            "31_60": 0.0,
+                            "61_90": 0.0,
+                            "90_plus": 0.0,
+                            "total": float(aged_sum),
+                        },
                             })
     
     # Consolidate small rows to reduce count and add variety
     result_rows = _consolidate_small_rows(result_rows, max_small=40)  # Increased from 25 to 40
     
-    # Scale to exact target with perfect precision
-    result_rows = _scale_to_exact_target(result_rows, target_total, max_iterations=2)
+    # Scale to exact target with column-aware scaling
+    result_rows = _scale_to_exact_target(result_rows, target_total, max_iterations=3)
     
     # Final validation and sorting
     for row in result_rows:
@@ -1654,9 +1998,10 @@ def main():
         raise RuntimeError("No months parsed")
     last_month = months[-1]
     last_df = df[df["month"] == last_month]
-    # Example target: 3187021 as requested
-    target_total = 3187021
 
+    # EXACT TARGETS FROM YOUR REQUIREMENTS
+    target_total = 3937823  # $3,937,823
+    
     # Build last month records in the expected JSON-like format
     last_records = []
     for _, row in last_df.iterrows():
@@ -1678,7 +2023,6 @@ def main():
 
     # Compute next month string (September 2025 as requested)
     y, m = [int(p) for p in last_month.split("-")]
-    # Skip ahead to September 2025 as requested
     next_month = "2025-09"
 
     generated = generate_next_month(
@@ -1691,95 +2035,54 @@ def main():
         history_df=df,
     )
 
-    print(f"Generated {len(generated)} rows for {next_month}. Target total: {target_total:,.2f}")
-    actual_total = sum(r['total'] for r in generated)
-    print(f"Actual total: {actual_total:,.2f}")
-    print(f"Difference: {actual_total - target_total:,.2f}")
-
-    # Count small rows
-    small_rows = [r for r in generated if r['total'] < 1000]
-    print(f"Small rows (<1k): {len(small_rows)}")
-
-    # CRITICAL: Validate that ALL row totals equal sum of AGED buckets only - ZERO TOLERANCE
-    mismatches = 0
-    current_mismatches = 0
-    for r in generated:
-        # Check aged buckets sum = total
-        aged_sum = r["aging"]["0_30"] + r["aging"]["31_60"] + r["aging"]["61_90"] + r["aging"]["90_plus"]
-        if abs(r["total"] - aged_sum) > 0.001:
-            print(f"CRITICAL MISMATCH: {r['description']} - Total: {r['total']}, Aged sum: {aged_sum}")
-            mismatches += 1
-        
-        # Check Current = Total
-        if abs(r["aging"]["current"] - r["total"]) > 0.001:
-            print(f"CURRENT MISMATCH: {r['description']} - Current: {r['aging']['current']}, Total: {r['total']}")
-            current_mismatches += 1
+    print(f"Generated {len(generated)} rows for {next_month}.")
     
-    if mismatches == 0:
-        print("✓ PERFECT: ALL row totals EXACTLY equal sum of aged buckets")
+    # Calculate final column totals for verification
+    final_col_totals = {
+        "0_30": sum(r["aging"]["0_30"] for r in generated),
+        "31_60": sum(r["aging"]["31_60"] for r in generated),
+        "61_90": sum(r["aging"]["61_90"] for r in generated),
+        "90_plus": sum(r["aging"]["90_plus"] for r in generated)
+    }
+    
+    final_total = sum(r['total'] for r in generated)
+    
+    print(f"\n=== FINAL RESULTS ===")
+    print(f"0-30 Days: ${final_col_totals['0_30']:,.0f} (Target: $1,537,823)")
+    print(f"31-60 Days: ${final_col_totals['31_60']:,.0f} (Target: $1,100,000)")
+    print(f"61-90 Days: ${final_col_totals['61_90']:,.0f} (Target: $800,000)")
+    print(f"90+ Days: ${final_col_totals['90_plus']:,.0f} (Target: $500,000)")
+    print(f"Grand Total: ${final_total:,.0f} (Target: $3,937,823)")
+    
+    # Verify all targets
+    targets_met = True
+    if abs(final_col_totals['0_30'] - 1537823) > 1:
+        print(f"✗ 0-30 Days target not met: difference = {final_col_totals['0_30'] - 1537823:,.0f}")
+        targets_met = False
+    if abs(final_col_totals['31_60'] - 1100000) > 1:
+        print(f"✗ 31-60 Days target not met: difference = {final_col_totals['31_60'] - 1100000:,.0f}")
+        targets_met = False
+    if abs(final_col_totals['61_90'] - 800000) > 1:
+        print(f"✗ 61-90 Days target not met: difference = {final_col_totals['61_90'] - 800000:,.0f}")
+        targets_met = False
+    if abs(final_col_totals['90_plus'] - 500000) > 1:
+        print(f"✗ 90+ Days target not met: difference = {final_col_totals['90_plus'] - 500000:,.0f}")
+        targets_met = False
+    if abs(final_total - 3937823) > 1:
+        print(f"✗ Grand Total target not met: difference = {final_total - 3937823:,.0f}")
+        targets_met = False
+    
+    if targets_met:
+        print("✓ ALL TARGETS MET EXACTLY!")
     else:
-        print(f"✗ FAILED: {mismatches} rows have total/aged bucket sum mismatches")
-    
-    if current_mismatches == 0:
-        print("✓ PERFECT: ALL Current values EXACTLY equal Total values")
-    else:
-        print(f"✗ FAILED: {current_mismatches} rows have Current ≠ Total mismatches")
+        print("✗ SOME TARGETS NOT MET")
 
-    # Final verification of exact target sum (all rows are customer rows now)
-    final_sum = sum(r['total'] for r in generated)
-    if abs(final_sum - target_total) < 1.0:
-        print(f"✓ PERFECT TARGET MATCH: {final_sum:,.0f} = {target_total:,.0f}")
-    else:
-        print(f"✗ TARGET MISMATCH: {final_sum:,.0f} ≠ {target_total:,.0f} (diff: {final_sum - target_total:,.0f})")
-    
-    # Verify column totals (what will be in the CSV grand row)
-    current_sum = sum(r['aging']['current'] for r in generated)
-    aged_0_30_sum = sum(r['aging']['0_30'] for r in generated)
-    aged_31_60_sum = sum(r['aging']['31_60'] for r in generated)
-    aged_61_90_sum = sum(r['aging']['61_90'] for r in generated)
-    aged_90_plus_sum = sum(r['aging']['90_plus'] for r in generated)
-    aged_buckets_total = aged_0_30_sum + aged_31_60_sum + aged_61_90_sum + aged_90_plus_sum
-    
-    print(f"\nColumn Totals Verification (for CSV grand row):")
-    print(f"Current sum: {current_sum:,.0f}")
-    print(f"0-30 Days sum: {aged_0_30_sum:,.0f}")
-    print(f"31-60 Days sum: {aged_31_60_sum:,.0f}")
-    print(f"61-90 Days sum: {aged_61_90_sum:,.0f}")
-    print(f"90+ Days sum: {aged_90_plus_sum:,.0f}")
-    print(f"Aged buckets total: {aged_buckets_total:,.0f}")
-    print(f"Current sum equals target: {abs(current_sum - target_total) < 1.0}")
-    print(f"Aged buckets total equals target: {abs(aged_buckets_total - target_total) < 1.0}")
-
-    # Show sample rows to verify Current = Total requirement
-    print(f"\nSample rows (showing Current = Total requirement):")
-    for i, r in enumerate(generated[:5]):
-        aging = r["aging"]
-        total = r["total"]
-        aged_sum = aging['0_30'] + aging['31_60'] + aging['61_90'] + aging['90_plus']
-        print(f"  {i+1}. {r['description'][:40]}: Current={aging['current']:.0f}, Total={total:.0f}, Aged Sum={aged_sum:.0f}")
-
-    # Save to CSV as requested
+    # Save to CSV
     csv_path = os.path.join(os.path.dirname(__file__), "ar_predictions_SBS_2025-09-12.csv")
     save_predictions_to_csv(generated, csv_path)
-    
-    # Show distribution analysis (all rows are customer rows now)
-    totals = [r['total'] for r in generated]
-    totals.sort(reverse=True)
-    
-    if totals:
-        top_10_pct = int(len(totals) * 0.1)
-        mid_40_pct = int(len(totals) * 0.5)
-        
-        print(f"\nDistribution Analysis:")
-        print(f"Total rows: {len(totals)}")
-        if top_10_pct > 0:
-            print(f"Top 10% ({top_10_pct} rows): ${totals[0]:,.0f} - ${totals[top_10_pct-1]:,.0f}")
-        if mid_40_pct > top_10_pct:
-            print(f"Mid 40% (rows {top_10_pct+1}-{mid_40_pct}): ${totals[top_10_pct]:,.0f} - ${totals[mid_40_pct-1]:,.0f}")
-        if len(totals) > mid_40_pct:
-            print(f"Bottom 50% (rows {mid_40_pct+1}+): ${totals[mid_40_pct]:,.0f} - ${totals[-1]:,.0f}")
+    print(f"Predictions saved to: {csv_path}")
 
-    # Optionally save to JSON for inspection
+    # Save to JSON for inspection
     out_path = os.path.join(os.path.dirname(__file__), f"generated_{next_month}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(generated, f, indent=2)

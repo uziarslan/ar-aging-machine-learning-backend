@@ -463,6 +463,8 @@ class PredictionRequest(BaseModel):
     carry_threshold: float = Field(0.2, ge=0, le=1, description="Carry-forward threshold")
     # New: optional additional entries that should be deducted from target_total
     additional_entries: Optional[List[Dict[str, Any]]] = Field(None, description="List of additional entries: {description, amount}")
+    # New: column-specific targets from frontend (optional)
+    column_targets: Optional[Dict[str, float]] = Field(None, description="Column targets: {b0_30, b31_60, b61_90, b90_plus}")
 
     @validator("additional_entries", pre=True, always=True)
     def _normalize_additional_entries(cls, v):
@@ -924,7 +926,13 @@ async def predict_aging(request: PredictionRequest):
 
         # Don't deduct user overrides from target - let generator produce full target
         # We'll override specific rows after generation
+        # Prefer column_targets sum if provided
         effective_target_total = float(request.target_total)
+        column_targets_payload = request.column_targets or {}
+        if column_targets_payload:
+            ct_sum = float(column_targets_payload.get("b0_30", 0) + column_targets_payload.get("b31_60", 0) + column_targets_payload.get("b61_90", 0) + column_targets_payload.get("b90_plus", 0))
+            if ct_sum > 0:
+                effective_target_total = ct_sum
         warnings: List[str] = []
 
         # Generate predictions without overrides - we'll apply them manually after
@@ -954,6 +962,8 @@ async def predict_aging(request: PredictionRequest):
                 "total": float(p.get("total", 0.0)),
                 # Expose override flag for frontend logic
                 "is_override": bool(p.get("is_override", False)),
+                # Preserve auto_generated marker from generator for downstream logic
+                "auto_generated": bool(p.get("auto_generated", False)),
             })
 
         # Fallback: if predictions are empty or all-zero buckets, build a DB-only roll-forward
@@ -1094,32 +1104,251 @@ async def predict_aging(request: PredictionRequest):
                     "90_plus": 0.0,
                     "total": float(amt_int),
                     "is_override": True,
+                    "user_added": True,
                 }
                 flat_predictions.append(row)
                 pred_map[desc_key] = row
                 pred_map_clean[desc_clean_key] = row
 
         combined_predictions = flat_predictions
-        final_total = float(sum(p["total"] for p in combined_predictions))
+        # Make sure all numbers are integers and totals are consistent per row
+        for rp in combined_predictions:
+            rp["0_30"] = float(int(round(rp.get("0_30", 0.0))))
+            rp["31_60"] = float(int(round(rp.get("31_60", 0.0))))
+            rp["61_90"] = float(int(round(rp.get("61_90", 0.0))))
+            rp["90_plus"] = float(int(round(rp.get("90_plus", 0.0))))
+            row_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+            rp["total"] = float(row_total)
+            rp["current"] = float(row_total)
+
+        # Final small ±1 reconciliation if needed
+        def _sum_col(rows, key):
+            return int(sum(int(round(x.get(key, 0.0) or 0.0)) for x in rows))
+
+        col_sums = {
+            "0_30": _sum_col(combined_predictions, "0_30"),
+            "31_60": _sum_col(combined_predictions, "31_60"),
+            "61_90": _sum_col(combined_predictions, "61_90"),
+            "90_plus": _sum_col(combined_predictions, "90_plus"),
+        }
+        final_total = float(_sum_col(combined_predictions, "total"))
+
+        provided_targets = None
+        if column_targets_payload:
+            provided_targets = {
+                "0_30": int(round(float(column_targets_payload.get("b0_30", 0)))),
+                "31_60": int(round(float(column_targets_payload.get("b31_60", 0)))),
+                "61_90": int(round(float(column_targets_payload.get("b61_90", 0)))),
+                "90_plus": int(round(float(column_targets_payload.get("b90_plus", 0)))),
+            }
+
+        # First, reconcile any single-bucket ±1 drift to match provided targets
+        if provided_targets is not None:
+            # Recompute column sums in case they were rounded
+            col_sums = {
+                "0_30": _sum_col(combined_predictions, "0_30"),
+                "31_60": _sum_col(combined_predictions, "31_60"),
+                "61_90": _sum_col(combined_predictions, "61_90"),
+                "90_plus": _sum_col(combined_predictions, "90_plus"),
+            }
+            for bucket in ["31_60", "61_90", "90_plus", "0_30"]:
+                diff = provided_targets[bucket] - col_sums[bucket]
+                if abs(diff) == 1:
+                    sign = 1 if diff > 0 else -1
+                    for rp in combined_predictions:
+                        if bucket in ["31_60", "61_90", "90_plus"] and (rp.get("user_added") or rp.get("auto_generated")):
+                            continue
+                        rp[bucket] = float(int(round(rp[bucket])) + sign)
+                        new_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+                        rp["total"] = float(new_total)
+                        rp["current"] = float(new_total)
+                        break
+                    # update sums post-adjustment
+                    col_sums[bucket] += sign
+
+        # Then, reconcile grand total if off by ±1
+        total_target = sum(provided_targets.values()) if provided_targets is not None else int(round(effective_target_total))
+        final_total = float(_sum_col(combined_predictions, "total"))
+        grand_diff = total_target - int(final_total)
+        if abs(grand_diff) == 1:
+            sign = 1 if grand_diff > 0 else -1
+            # Try to adjust a bucket that won't violate user_added/auto_generated constraints
+            for candidate_bucket in ["31_60", "61_90", "90_plus", "0_30"]:
+                for rp in combined_predictions:
+                    if candidate_bucket in ["31_60", "61_90", "90_plus"] and (rp.get("user_added") or rp.get("auto_generated")):
+                        continue
+                    rp[candidate_bucket] = float(int(round(rp[candidate_bucket])) + sign)
+                    new_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+                    rp["total"] = float(new_total)
+                    rp["current"] = float(new_total)
+                    break
+                else:
+                    continue
+                break
+            final_total = float(_sum_col(combined_predictions, "total"))
+
         
-        # Final adjustment to hit exact target
-        target_diff = float(request.target_total) - final_total
-        if abs(target_diff) > 1.0:  # Only adjust if difference is more than $1
-            # Adjust generator rows (non-override) proportionally
-            generator_rows = [p for p in combined_predictions if not p.get("is_override", False)]
-            if generator_rows and target_diff != 0:
-                total_generator = sum(p["total"] for p in generator_rows)
-                if total_generator > 0:
-                    adjustment_factor = 1.0 + (target_diff / total_generator)
-                    for p in generator_rows:
-                        p["total"] = float(p["total"] * adjustment_factor)
-                        p["current"] = p["total"]
-                        # Adjust 0_30 proportionally to maintain bucket ratios
-                        if p["total"] > 0:
-                            old_0_30 = p.get("0_30", 0)
-                            if old_0_30 > 0:
-                                p["0_30"] = float(p["0_30"] * adjustment_factor)
-                    final_total = float(sum(p["total"] for p in combined_predictions))
+        # CRITICAL: Re-apply exact column target scaling after user entries are processed
+        # The ML model calculates perfect targets, but user entries can break them
+        from train_generate_ar import _scale_to_exact_target
+        
+        # Build per-row caps based on previous month: caps map (use same cleaning as generator)
+        caps_map: Dict[str, Dict[str, float]] = {}
+        for d in prev_docs:
+            from train_generate_ar import _clean_description as _gen_clean_desc
+            key = _gen_clean_desc(str(d.get("description", ""))).lower()
+            prev_0_30 = float(d.get("aging", {}).get("0_30", 0.0))
+            prev_31_60 = float(d.get("aging", {}).get("31_60", 0.0))
+            prev_61_90 = float(d.get("aging", {}).get("61_90", 0.0))
+            prev_90_plus = float(d.get("aging", {}).get("90_plus", 0.0))
+            caps_map[key] = {
+                "31_60": prev_0_30,
+                "61_90": prev_31_60,
+                "90_plus": prev_61_90 + prev_90_plus,
+            }
+
+        # Convert flattened format back to 'aging' structure for _scale_to_exact_target
+        converted_predictions = []
+        for p in combined_predictions:
+            converted_predictions.append({
+                "description": p["description"],
+                "month": p.get("month", ""),
+                "aging": {
+                    "current": float(p.get("current", 0.0)),
+                    "0_30": float(p.get("0_30", 0.0)),
+                    "31_60": float(p.get("31_60", 0.0)),
+                    "61_90": float(p.get("61_90", 0.0)),
+                    "90_plus": float(p.get("90_plus", 0.0)),
+                },
+                "total": float(p.get("total", 0.0)),
+                "predicted": p.get("predicted", True),
+                "is_override": p.get("is_override", False),
+                # Ensure scaler knows this is a user-added row (0-30 only)
+                "user_added": bool(p.get("user_added", False)),
+                # Preserve auto_generated flag through scaling so we can enforce 0-30-only after
+                "auto_generated": bool(p.get("auto_generated", False)),
+                # Attach per-row caps for older buckets to guide the scaler rebalancing
+                "_caps": caps_map.get(_gen_clean_desc(p["description"]).lower(), {}),
+            })
+        
+        # Map frontend keys to scaler's keys if provided
+        if column_targets_payload:
+            column_targets_for_scaler = {
+                "0_30": float(column_targets_payload.get("b0_30", 0)),
+                "31_60": float(column_targets_payload.get("b31_60", 0)),
+                "61_90": float(column_targets_payload.get("b61_90", 0)),
+                "90_plus": float(column_targets_payload.get("b90_plus", 0)),
+            }
+        else:
+            column_targets_for_scaler = None
+        
+        # Apply scaling to converted format with dynamic column targets
+        scaled_predictions = _scale_to_exact_target(converted_predictions, effective_target_total, column_targets_for_scaler)
+        
+        # Convert back to flattened format for API response (no post-processing of buckets here)
+        combined_predictions = []
+        for p in scaled_predictions:
+            desc = p["description"]
+            is_adjustment = bool(p.get("is_adjustment"))
+            # Optional: Rename adjustment description only; do not change numbers
+            if is_adjustment:
+                used_descs = { _norm_desc(x["description"]) for x in flat_predictions }
+                hist_candidates = [
+                    d for d in df_hist["description"].astype(str).unique().tolist()
+                    if _norm_desc(d) not in prev_desc_set and _norm_desc(d) not in used_descs
+                ]
+                if hist_candidates:
+                    desc = hist_candidates[0]
+                else:
+                    desc = "Adjustment Client"
+            # Determine if this row existed in previous month (definition of carried vs generated)
+            from train_generate_ar import _clean_description as _gen_clean_desc
+            is_new_this_month = (_gen_clean_desc(desc).lower() not in prev_desc_set)
+            must_zero_older = bool(p.get("user_added") or p.get("auto_generated") or is_new_this_month)
+
+            combined_predictions.append({
+                "description": desc,
+                # Enforce 0-30-only for user_added and auto_generated at the boundary (double safety)
+                "current": float(p["aging"].get("0_30", 0.0)) if must_zero_older else float(p["aging"].get("current", 0.0)),
+                "0_30": float(p["aging"].get("0_30", 0.0)),
+                "31_60": 0.0 if must_zero_older else float(p["aging"].get("31_60", 0.0)),
+                "61_90": 0.0 if must_zero_older else float(p["aging"].get("61_90", 0.0)),
+                "90_plus": 0.0 if must_zero_older else float(p["aging"].get("90_plus", 0.0)),
+                "total": float(p["aging"].get("0_30", 0.0)) if must_zero_older else float(
+                    float(p["aging"].get("0_30", 0.0)) + float(p["aging"].get("31_60", 0.0)) + float(p["aging"].get("61_90", 0.0)) + float(p["aging"].get("90_plus", 0.0))
+                ),
+                "is_override": bool(p.get("is_override", False)),
+                "user_added": bool(p.get("user_added", False)),
+                "auto_generated": bool(p.get("auto_generated", False)),
+                "is_new": bool(is_new_this_month),
+            })
+        
+        # FINAL ROUNDING AND ±1 RECONCILIATION AFTER SCALER AND ZEROING
+        # Normalize integers and row totals
+        for rp in combined_predictions:
+            rp["0_30"] = float(int(round(rp.get("0_30", 0.0))))
+            rp["31_60"] = float(int(round(rp.get("31_60", 0.0))))
+            rp["61_90"] = float(int(round(rp.get("61_90", 0.0))))
+            rp["90_plus"] = float(int(round(rp.get("90_plus", 0.0))))
+            row_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+            rp["total"] = float(row_total)
+            rp["current"] = float(row_total)
+
+        def _sum_col(rows, key):
+            return int(sum(int(round(x.get(key, 0.0) or 0.0)) for x in rows))
+
+        provided_targets = None
+        if column_targets_payload:
+            provided_targets = {
+                "0_30": int(round(float(column_targets_payload.get("b0_30", 0)))),
+                "31_60": int(round(float(column_targets_payload.get("b31_60", 0)))),
+                "61_90": int(round(float(column_targets_payload.get("b61_90", 0)))),
+                "90_plus": int(round(float(column_targets_payload.get("b90_plus", 0)))),
+            }
+
+        # First reconcile any single-bucket ±1 differences to match provided targets
+        if provided_targets is not None:
+            col_sums = {
+                "0_30": _sum_col(combined_predictions, "0_30"),
+                "31_60": _sum_col(combined_predictions, "31_60"),
+                "61_90": _sum_col(combined_predictions, "61_90"),
+                "90_plus": _sum_col(combined_predictions, "90_plus"),
+            }
+            for bucket in ["31_60", "61_90", "90_plus", "0_30"]:
+                diff = provided_targets[bucket] - col_sums[bucket]
+                if abs(diff) == 1:
+                    sign = 1 if diff > 0 else -1
+                    for rp in combined_predictions:
+                        if bucket in ["31_60", "61_90", "90_plus"] and (rp.get("user_added") or rp.get("auto_generated") or rp.get("is_new")):
+                            continue
+                        rp[bucket] = float(int(round(rp[bucket])) + sign)
+                        new_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+                        rp["total"] = float(new_total)
+                        rp["current"] = float(new_total)
+                        break
+                    col_sums[bucket] += sign
+
+        # Then reconcile grand total if off by ±1
+        total_target = sum(provided_targets.values()) if provided_targets is not None else int(round(effective_target_total))
+        final_total = float(_sum_col(combined_predictions, "total"))
+        grand_diff = total_target - int(final_total)
+        if abs(grand_diff) == 1:
+            sign = 1 if grand_diff > 0 else -1
+            for candidate_bucket in ["31_60", "61_90", "90_plus", "0_30"]:
+                for rp in combined_predictions:
+                    if candidate_bucket in ["31_60", "61_90", "90_plus"] and (rp.get("user_added") or rp.get("auto_generated") or rp.get("is_new")):
+                        continue
+                    rp[candidate_bucket] = float(int(round(rp[candidate_bucket])) + sign)
+                    new_total = int(rp["0_30"] + rp["31_60"] + rp["61_90"] + rp["90_plus"]) 
+                    rp["total"] = float(new_total)
+                    rp["current"] = float(new_total)
+                    break
+                else:
+                    continue
+                break
+
+        # Final recompute of grand total
+        final_total = float(_sum_col(combined_predictions, "total"))
         
         audit_snapshot_id = str(uuid4())
         
