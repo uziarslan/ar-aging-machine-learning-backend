@@ -690,9 +690,21 @@ PORT = int(os.getenv("PORT", "8000"))
 async def startup_event():
     global mongo_client, mongo_db
     
-    # Connect to MongoDB
-    mongo_client = MongoClient(MONGO_URI)
-    mongo_db = mongo_client.get_default_database()
+    # Connect to MongoDB with SSL configuration
+    try:
+        mongo_client = MongoClient(
+            MONGO_URI, 
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000
+        )
+        # Test the connection
+        mongo_client.admin.command('ping')
+        mongo_db = mongo_client.get_default_database()
+        logger.info("MongoDB connection established successfully")
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        raise
     
     logger.info(f"Integrated backend initialized successfully")
     logger.info(f"MongoDB URI: {MONGO_URI}")

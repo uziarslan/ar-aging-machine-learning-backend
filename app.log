@@ -1,0 +1,13 @@
+2025-10-03 22:50:42,254 - __main__ - INFO - Integrated backend initialized successfully
+2025-10-03 22:50:42,254 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
+2025-10-03 22:50:42,254 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
+2025-10-03 22:50:42,254 - __main__ - INFO - Debug mode: False
+2025-10-03 22:56:40,509 - __main__ - INFO - Integrated backend initialized successfully
+2025-10-03 22:56:40,510 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
+2025-10-03 22:56:40,510 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
+2025-10-03 22:56:40,510 - __main__ - INFO - Debug mode: False
+2025-10-03 23:01:09,258 - __main__ - INFO - MongoDB connection established successfully
+2025-10-03 23:01:09,258 - __main__ - INFO - Integrated backend initialized successfully
+2025-10-03 23:01:09,258 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
+2025-10-03 23:01:09,259 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
+2025-10-03 23:01:09,259 - __main__ - INFO - Debug mode: False
