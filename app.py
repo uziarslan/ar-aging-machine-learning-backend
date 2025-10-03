@@ -17,9 +17,18 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from uuid import uuid4
 from io import StringIO, BytesIO
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
+from fastapi import APIRouter, Body
+from fastapi.security import OAuth2PasswordRequestForm, HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
@@ -36,7 +45,26 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Production logging setup
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Console output
+    ]
+)
+
+# Add file logging in production
+debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+if not debug_mode:
+    file_handler = RotatingFileHandler('app.log', maxBytes=10485760, backupCount=5)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -47,18 +75,120 @@ app = FastAPI(
 )
 
 # CORS middleware
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# Security middleware for production
+if not debug_mode:
+    # Trusted host middleware
+    trusted_hosts = os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1").split(",")
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
 # Global variables
 mongo_client = None
 mongo_db = None
 client_models = {}  # Deprecated cache; kept for backward compatibility but unused
+
+# ------------------------------- Auth/JWT Setup ------------------------------- #
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+oauth2_scheme = HTTPBearer(auto_error=False)
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "43200"))  # 30 days
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+
+class TokenResponse(BaseModel):
+    token: str
+    user: UserOut
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+def _hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def _create_access_token(data: dict, expires_minutes: int = JWT_EXPIRE_MINUTES) -> str:
+    from datetime import datetime, timedelta
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme)) -> Optional[dict]:
+    if credentials is None:
+        return None
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+        users_col = mongo_db["users"]
+        user = users_col.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            return None
+        return user
+    except JWTError:
+        return None
+
+auth_router = APIRouter(prefix="/api/auth")
+
+@auth_router.post("/user/signup", response_model=TokenResponse)
+async def signup(user_in: UserCreate):
+    users_col = mongo_db["users"]
+    existing = users_col.find_one({"email": user_in.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_doc = {
+        "email": user_in.email.lower(),
+        "name": user_in.name or "",
+        "password_hash": _hash_password(user_in.password),
+        "created_at": datetime.now(),
+    }
+    res = users_col.insert_one(user_doc)
+    user_id = str(res.inserted_id)
+    token = _create_access_token({"sub": user_id})
+    return TokenResponse(token=token, user=UserOut(id=user_id, email=user_doc["email"], name=user_doc["name"]))
+
+@auth_router.post("/user/login", response_model=TokenResponse)
+async def login(body: LoginRequest):
+    users_col = mongo_db["users"]
+    email = (body.email or "").lower()
+    password = body.password or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Missing credentials")
+    user = users_col.find_one({"email": email})
+    if not user or not _verify_password(password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    user_id = str(user["_id"])
+    token = _create_access_token({"sub": user_id})
+    return TokenResponse(token=token, user=UserOut(id=user_id, email=user["email"], name=user.get("name")))
+
+@auth_router.get("/user", response_model=UserOut)
+async def get_me(current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return UserOut(id=str(current_user["_id"]), email=current_user["email"], name=current_user.get("name"))
 
 # ------------------------------- Data Cleaning Functions ------------------------------- #
 
@@ -540,11 +670,20 @@ Old embedded ML classes removed. We now rely on train_generate_ar.train_model an
 """
 
 # Environment configuration
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/ar_aging")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "demo-api-key-123")
+MONGO_URI = os.getenv("MONGO_URI")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+# Validate required environment variables
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is required")
+if not ADMIN_API_KEY:
+    raise ValueError("ADMIN_API_KEY environment variable is required")
+if not JWT_SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable is required")
+
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 # Startup event
 @app.on_event("startup")
@@ -558,7 +697,13 @@ async def startup_event():
     logger.info(f"Integrated backend initialized successfully")
     logger.info(f"MongoDB URI: {MONGO_URI}")
     logger.info(f"Host: {HOST}, Port: {PORT}")
-    logger.info(f"Debug mode: {DEBUG}")
+    logger.info(f"Debug mode: {debug_mode}")
+
+    # Ensure users collection index
+    try:
+        mongo_db["users"].create_index("email", unique=True)
+    except Exception:
+        pass
 
 # Shutdown event
 @app.on_event("shutdown")
@@ -572,6 +717,9 @@ async def shutdown_event():
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+# Mount auth router
+app.include_router(auth_router)
 
 
 @app.get("/api/clients", response_model=List[ClientInfo])
@@ -1884,4 +2032,5 @@ async def run_retrain_job(job_id: str, client_id: str):
         logger.error(f"Retrain job {job_id} failed with exception: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT, reload=DEBUG)
+    # Only use reload in development
+    uvicorn.run(app, host=HOST, port=PORT, reload=False)
