@@ -1923,8 +1923,10 @@ async def get_clients_summary():
 
 # Background task for retraining
 async def run_retrain_job(job_id: str, client_id: str):
-    """Run retrain job in background"""
+    """Run retrain job in background with memory optimization"""
     try:
+        import gc  # Garbage collection for memory management
+        
         ml_jobs_collection = mongo_db["ml_jobs"]
         ar_data_collection = mongo_db["ar_data"]
         models_collection = mongo_db["models"]
@@ -1934,6 +1936,15 @@ async def run_retrain_job(job_id: str, client_id: str):
             {"_id": job_id},
             {"$set": {"status": "running", "started_at": datetime.now()}}
         )
+        
+        # Force garbage collection before training
+        gc.collect()
+        
+        # Log memory usage
+        import psutil
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage before training: {memory_mb:.1f} MB")
         
         # Get ALL client data (historical + approved predictions for training)
         all_data = list(ar_data_collection.find(
@@ -1960,7 +1971,30 @@ async def run_retrain_job(job_id: str, client_id: str):
 
         # Train new model with new pipeline (including newly approved data)
         logger.info(f"Retraining model for client {client_id} with {len(df)} data points across {df['month'].nunique()} months")
+        
+        # Clear DataFrame from memory before training
+        del df
+        gc.collect()
+        
+        # Recreate DataFrame for training (memory optimization)
+        df = pd.DataFrame([
+            {
+                'month': r['month'],
+                'description': r['description'],
+                'current': float(r['aging'].get('current', 0.0)),
+                '0_30': float(r['aging'].get('0_30', 0.0)),
+                '31_60': float(r['aging'].get('31_60', 0.0)),
+                '61_90': float(r['aging'].get('61_90', 0.0)),
+                '90_plus': float(r['aging'].get('90_plus', 0.0)),
+                'total': float(r.get('total', 0.0)),
+            } for r in all_data
+        ])
+        
         artifacts, metrics = new_train_model(df, client_name="SBS", models_dir=os.path.join(os.path.dirname(__file__), "models"))
+        
+        # Clear training data from memory
+        del df, all_data
+        gc.collect()
         
         # Use GridFS for large model files instead of embedding in document
         from gridfs import GridFSBucket
@@ -2018,17 +2052,22 @@ async def run_retrain_job(job_id: str, client_id: str):
             pass
         
         # Update job status to completed
+        model_version = artifacts.version
         ml_jobs_collection.update_one(
             {"_id": job_id},
             {"$set": {
                 "status": "completed",
                 "completed_at": datetime.now(),
-                "model_version": artifacts.version,
+                "model_version": model_version,
                 "message": "Training completed successfully",
             }}
         )
         
         logger.info(f"Retrain job {job_id} completed successfully for client {client_id}")
+        
+        # Final memory cleanup
+        del artifacts, metrics, model_doc, model_version
+        gc.collect()
         
     except Exception as e:
         # Update job status to failed

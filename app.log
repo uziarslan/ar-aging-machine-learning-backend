@@ -11,3 +11,24 @@
 2025-10-03 23:01:09,258 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
 2025-10-03 23:01:09,259 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
 2025-10-03 23:01:09,259 - __main__ - INFO - Debug mode: False
+2025-10-03 23:14:29,994 - __main__ - INFO - MongoDB connection established successfully
+2025-10-03 23:14:29,996 - __main__ - INFO - Integrated backend initialized successfully
+2025-10-03 23:14:29,996 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
+2025-10-03 23:14:29,996 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
+2025-10-03 23:14:29,997 - __main__ - INFO - Debug mode: False
+2025-10-03 23:58:15,109 - __main__ - ERROR - Prediction failed: 404: No trained model found for this client
+2025-10-04 00:06:03,766 - __main__ - INFO - Uploaded and trained model for client SBS (68e01d8d4b5180accb3126d3) - 47 sheets, 5325 records
+2025-10-04 02:45:25,899 - __main__ - INFO - MongoDB connection established successfully
+2025-10-04 02:45:25,900 - __main__ - INFO - Integrated backend initialized successfully
+2025-10-04 02:45:25,900 - __main__ - INFO - MongoDB URI: mongodb+srv://jobjarvis:jobjarvismongo@jobjarvis.pdweuom.mongodb.net/ar_aging
+2025-10-04 02:45:25,900 - __main__ - INFO - Host: 0.0.0.0, Port: 8000
+2025-10-04 02:45:25,900 - __main__ - INFO - Debug mode: False
+2025-10-04 03:01:53,902 - __main__ - ERROR - Upload failed: you are over your space quota, using 528 MB of 512 MB, full error: {'ok': 0, 'errmsg': 'you are over your space quota, using 528 MB of 512 MB', 'code': 8000, 'codeName': 'AtlasError'}
+2025-10-04 03:13:53,558 - __main__ - INFO - Uploaded and trained model for client SBS (68e049f3ffb32d3bc195c1e4) - 47 sheets, 5325 records
+2025-10-04 03:48:40,162 - __main__ - INFO - Approved predictions for client 68e049f3ffb32d3bc195c1e4, month 2025-08. Auto-retraining model with new data.
+2025-10-04 03:48:40,522 - __main__ - INFO - Memory usage before training: 273.2 MB
+2025-10-04 03:48:41,997 - __main__ - INFO - Retraining model for client 68e049f3ffb32d3bc195c1e4 with 5552 data points across 48 months
+2025-10-04 03:49:01,348 - __main__ - INFO - Deleted existing GridFS model file 68e04a24ffb32d3bc195c1e5 for client 68e049f3ffb32d3bc195c1e4
+2025-10-04 03:49:01,863 - __main__ - INFO - Deleted existing GridFS model file 68e04a26ffb32d3bc195c1e7 for client 68e049f3ffb32d3bc195c1e4
+2025-10-04 03:51:22,800 - __main__ - INFO - Stored model metadata and GridFS files for client 68e049f3ffb32d3bc195c1e4, version ar_aging_20251003_224900
+2025-10-04 03:51:22,997 - __main__ - INFO - Retrain job cee12129-c646-457c-acb5-a80013ac4155 completed successfully for client 68e049f3ffb32d3bc195c1e4
