@@ -887,8 +887,6 @@ async def upload_client_data(
         memory_mb = process.memory_info().rss / 1024 / 1024
         if memory_mb > 400:  # If memory is over 400MB, force cleanup
             logger.warning(f"High memory usage detected: {memory_mb:.1f} MB. Forcing aggressive cleanup.")
-            import os
-            import sys
             # Force Python garbage collection multiple times
             for _ in range(3):
                 gc.collect()
