@@ -1,1 +1,1 @@
-web: gunicorn app:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 600 --keep-alive 2 --max-requests 25 --max-requests-jitter 5 --worker-connections 100 --worker-tmp-dir /dev/shm --preload --worker-tmp-dir /tmp
+web: PYTHONHASHSEED=0 gunicorn app:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 600 --keep-alive 2 --max-requests 25 --max-requests-jitter 5 --worker-connections 100 --worker-tmp-dir /dev/shm --preload
