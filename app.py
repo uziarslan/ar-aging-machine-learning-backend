@@ -782,6 +782,14 @@ async def upload_client_data(
 ):
     """Upload Excel data for a new client and train models using data cleaning pipeline"""
     try:
+        import gc  # Force garbage collection
+        import psutil
+        
+        # Log memory before processing
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage before upload: {memory_mb:.1f} MB")
+        
         # Read file contents
         contents = await file.read()
         file_extension = file.filename.split('.')[-1].lower()
@@ -791,6 +799,11 @@ async def upload_client_data(
         
         # Use data cleaning pipeline to process all sheets
         sheets = _read_all_sheets(contents)
+        
+        # Clear file contents from memory
+        del contents
+        gc.collect()
+        
         all_documents = []
         
         # Create or get client
@@ -819,6 +832,10 @@ async def upload_client_data(
             # Prepare documents for this sheet
             docs = _prepare_documents(standardized, client_id, month_str)
             all_documents.extend(docs)
+            
+            # Clear sheet data from memory after processing
+            del reframed_df, standardized, docs
+            gc.collect()
         
         if not all_documents:
             raise HTTPException(status_code=400, detail="No valid data found in any sheet. Please check that your Excel file contains AR aging data with proper headers.")
@@ -841,6 +858,14 @@ async def upload_client_data(
                 'total': d['total'],
             } for d in all_documents
         ])
+        
+        # Log memory before training
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage before training: {memory_mb:.1f} MB")
+        
+        # Clear all_documents from memory before training
+        del all_documents
+        gc.collect()
 
         # Remove any previous model records and artifacts for a clean test
         models_collection = mongo_db["models"]
@@ -873,6 +898,10 @@ async def upload_client_data(
             pass
 
         artifacts, metrics = new_train_model(df_training, client_name=client_name, models_dir=models_dir)
+        
+        # Clear training DataFrame from memory
+        del df_training
+        gc.collect()
         # Save model artifacts to GridFS using GridFSBucket for consistency
         from gridfs import GridFSBucket
         bucket = GridFSBucket(mongo_db)
@@ -910,6 +939,14 @@ async def upload_client_data(
                     os.remove(p)
         except Exception:
             pass
+        
+        # Clear model artifacts from memory
+        del artifacts, metrics, model_doc
+        gc.collect()
+        
+        # Log final memory usage
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage after upload: {memory_mb:.1f} MB")
         
         logger.info(f"Uploaded and trained model for client {client_name} ({client_id}) - {processed_sheets} sheets, {total_standardized_rows} records")
         
@@ -949,6 +986,8 @@ async def upload_client_data(
         )
         
     except Exception as e:
+        # Clean up memory on error
+        gc.collect()
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
