@@ -800,9 +800,13 @@ async def upload_client_data(
         # Use data cleaning pipeline to process all sheets
         sheets = _read_all_sheets(contents)
         
-        # Clear file contents from memory
+        # Clear file contents from memory immediately
         del contents
         gc.collect()
+        
+        # Log memory after file processing
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage after file read: {memory_mb:.1f} MB")
         
         all_documents = []
         
@@ -823,6 +827,9 @@ async def upload_client_data(
             standardized = _clean_and_standardize(reframed_df)
             
             if standardized.empty:
+                # Clear empty dataframes from memory
+                del reframed_df, standardized, sheet_df
+                gc.collect()
                 continue
                 
             processed_sheets += 1
@@ -834,8 +841,13 @@ async def upload_client_data(
             all_documents.extend(docs)
             
             # Clear sheet data from memory after processing
-            del reframed_df, standardized, docs
+            del reframed_df, standardized, docs, sheet_df
             gc.collect()
+            
+            # Log memory after each sheet
+            if processed_sheets % 5 == 0:  # Log every 5 sheets
+                memory_mb = process.memory_info().rss / 1024 / 1024
+                logger.info(f"Memory usage after processing {processed_sheets} sheets: {memory_mb:.1f} MB")
         
         if not all_documents:
             raise HTTPException(status_code=400, detail="No valid data found in any sheet. Please check that your Excel file contains AR aging data with proper headers.")
@@ -843,6 +855,10 @@ async def upload_client_data(
         # Insert all data using bulk upsert
         ar_data_collection = mongo_db["ar_data"]
         matched_or_upserted, upserted = _bulk_upsert_ar_data(ar_data_collection, all_documents)
+        
+        # Log memory after database operations
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        logger.info(f"Memory usage after database operations: {memory_mb:.1f} MB")
         
         # Train models using the new pipeline from train_generate_ar
         # Build DataFrame of historical data for this upload
@@ -866,6 +882,25 @@ async def upload_client_data(
         # Clear all_documents from memory before training
         del all_documents
         gc.collect()
+        
+        # Check memory before training and force cleanup if too high
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        if memory_mb > 400:  # If memory is over 400MB, force cleanup
+            logger.warning(f"High memory usage detected: {memory_mb:.1f} MB. Forcing aggressive cleanup.")
+            import os
+            import sys
+            # Force Python garbage collection multiple times
+            for _ in range(3):
+                gc.collect()
+            # Try to free up memory
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except:
+                pass
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            logger.info(f"Memory usage after aggressive cleanup: {memory_mb:.1f} MB")
 
         # Remove any previous model records and artifacts for a clean test
         models_collection = mongo_db["models"]
